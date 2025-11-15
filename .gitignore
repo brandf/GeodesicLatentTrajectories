@@ -1,0 +1,26 @@
+# Obsidian workspace
+obsidian/.obsidian/workspace*
+obsidian/.obsidian/plugins/**/*
+obsidian/.obsidian/community-plugins.json
+
+# Just the data file
+!obsidian/.obsidian/plugins/**/
+!obsidian/.obsidian/plugins/**/data.json
+
+# Node modules and build artifacts
+node_modules/
+.quartz-cache/
+public/
+
+# Keep configuration files
+!quartz.config.ts
+!quartz.layout.ts
+!./package.json
+!./package-lock.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Ignore symlinked project directories (if using the master-vault feature)
+obsidian/🚧 Projects/*

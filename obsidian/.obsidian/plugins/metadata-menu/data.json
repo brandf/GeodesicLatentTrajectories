@@ -1,0 +1,105 @@
+{
+  "presetFields": [
+    {
+      "type": "Select",
+      "tagName": "select",
+      "icon": "right-triangle",
+      "tooltip": "Accepts a single value from a list",
+      "colorClass": "select",
+      "options": {
+        "sourceType": "ValuesList",
+        "valuesList": {
+          "1": "😎 Confident",
+          "2": "😀 Happy",
+          "3": "😐 Neutral",
+          "4": "😞 Tired",
+          "5": "😤 Stressed",
+          "6": "🤮 Sick"
+        }
+      },
+      "name": "mood",
+      "id": "Wdj0OP",
+      "path": ""
+    },
+    {
+      "type": "Select",
+      "tagName": "select",
+      "icon": "right-triangle",
+      "tooltip": "Accepts a single value from a list",
+      "colorClass": "select",
+      "options": {
+        "sourceType": "ValuesList",
+        "valuesList": {
+          "1": "🔋 High",
+          "2": "⚡ Medium",
+          "3": "💤 Low"
+        }
+      },
+      "name": "energy",
+      "id": "XM1cHM",
+      "path": ""
+    },
+    {
+      "type": "Select",
+      "tagName": "select",
+      "icon": "right-triangle",
+      "tooltip": "Accepts a single value from a list",
+      "colorClass": "select",
+      "options": {
+        "sourceType": "ValuesList",
+        "valuesList": {
+          "1": "👨‍💼 coworker",
+          "2": "🧑‍💼 manager",
+          "3": "👥 collaborator",
+          "4": "🧑‍🏫 mentor",
+          "5": "🧑‍🎓 mentee",
+          "6": "👨‍👩‍👧‍👦 family",
+          "7": "💞 partner",
+          "8": "🧑‍🤝‍🧑 friend",
+          "9": "🫶 close friend",
+          "10": "💬 acquaintance",
+          "11": "🤝 contact",
+          "12": "🧑‍🔧 client",
+          "13": "🧑‍💻 vendor",
+          "14": "🧑‍💻 employee",
+          "15": "🧑‍⚖️ advisor"
+        }
+      },
+      "name": "relationship",
+      "id": "zcjrBx",
+      "path": ""
+    }
+  ],
+  "fileClassQueries": [],
+  "displayFieldsInContextMenu": true,
+  "globallyIgnoredFields": [],
+  "classFilesPath": null,
+  "isAutosuggestEnabled": true,
+  "fileClassAlias": "fileClass",
+  "settingsVersion": "5.5",
+  "firstDayOfWeek": 1,
+  "enableLinks": false,
+  "enableTabHeader": true,
+  "enableEditor": true,
+  "enableBacklinks": true,
+  "enableStarred": true,
+  "enableFileExplorer": true,
+  "enableSearch": true,
+  "enableProperties": true,
+  "tableViewMaxRecords": 20,
+  "frontmatterListDisplay": "asArray",
+  "fileClassExcludedFolders": [],
+  "showIndexingStatusInStatusBar": true,
+  "fileIndexingExcludedFolders": [],
+  "fileIndexingExcludedExtensions": [
+    ".excalidraw.md"
+  ],
+  "fileIndexingExcludedRegex": [],
+  "frontmatterOnly": false,
+  "showFileClassSelectInModal": true,
+  "chooseFileClassAtFileCreation": false,
+  "autoInsertFieldsAtFileClassInsertion": false,
+  "fileClassIcon": "package",
+  "isAutoCalculationEnabled": true,
+  "disableDataviewPrompt": false
+}
