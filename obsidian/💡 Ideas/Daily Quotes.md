@@ -1,2 +1,0 @@
-- "Replace this quote with your own." – brandf
-- "Use AI to collect quotes related to topics you like." – brandf
