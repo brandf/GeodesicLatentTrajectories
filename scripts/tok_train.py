@@ -3,6 +3,8 @@ Train a tokenizer using the HuggingFace Tokenizers library.
 In the style of GPT-4 tokenizer.
 """
 import os
+import sys
+import json
 import time
 import argparse
 import torch
@@ -43,6 +45,34 @@ def text_iterator():
                 return
 text_iter = text_iterator()
 
+base_dir = get_base_dir()
+tokenizer_dir = os.path.join(base_dir, "tokenizer")
+os.makedirs(tokenizer_dir, exist_ok=True)
+
+def existing_tokenizer_matches(args, tokenizer_dir):
+    required_files = [
+        os.path.join(tokenizer_dir, "tokenizer.pkl"),
+        os.path.join(tokenizer_dir, "token_bytes.pt"),
+        os.path.join(tokenizer_dir, "tokenizer_meta.json"),
+    ]
+    if not all(os.path.exists(fpath) for fpath in required_files):
+        return False
+    try:
+        with open(required_files[-1], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    expected = {
+        "max_chars": args.max_chars,
+        "doc_cap": args.doc_cap,
+        "vocab_size": args.vocab_size,
+    }
+    return meta == expected
+
+if existing_tokenizer_matches(args, tokenizer_dir):
+    print("Tokenizer artifacts already exist for these arguments; skipping training.")
+    sys.exit(0)
+
 # -----------------------------------------------------------------------------
 # Train the tokenizer
 t0 = time.time()
@@ -53,8 +83,6 @@ print(f"Training time: {train_time:.2f}s")
 
 # -----------------------------------------------------------------------------
 # Save the tokenizer to disk
-base_dir = get_base_dir()
-tokenizer_dir = os.path.join(base_dir, "tokenizer")
 tokenizer.save(tokenizer_dir)
 
 # -----------------------------------------------------------------------------
@@ -89,6 +117,16 @@ token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
 with open(token_bytes_path, "wb") as f:
     torch.save(token_bytes, f)
 print(f"Saved token_bytes to {token_bytes_path}")
+
+metadata = {
+    "max_chars": args.max_chars,
+    "doc_cap": args.doc_cap,
+    "vocab_size": args.vocab_size,
+}
+meta_path = os.path.join(tokenizer_dir, "tokenizer_meta.json")
+with open(meta_path, "w", encoding="utf-8") as f:
+    json.dump(metadata, f, indent=2)
+print(f"Saved tokenizer metadata to {meta_path}")
 
 # Log to report
 from nanochat.report import get_report

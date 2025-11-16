@@ -211,9 +211,8 @@ class GPT(nn.Module):
         return cos, sin
 
     def _project_latents(self, hidden: torch.Tensor) -> torch.Tensor:
-        if not self._glt_enabled:
-            return hidden
-        return glt_normalize(hidden, eps=self.glt_config.norm_eps)
+        # Temporarily disable hyperspherical normalization so GLT path matches baseline
+        return hidden
 
     def _build_valid_mask(self, targets: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if targets is None:
@@ -317,7 +316,8 @@ class GPT(nn.Module):
         total_loss = ce_loss
         breakdown = {"ce": ce_loss.detach()} if return_loss_breakdown else None
         if self._glt_enabled:
-            latents_for_loss = latents.float()
+            # Normalize latents only for GLT losses so the logits keep their original scale
+            latents_for_loss = glt_normalize(latents.float(), eps=self.glt_config.norm_eps)
             glt_losses = self._compute_glt_losses(latents_for_loss, mask)
             cfg = self.glt_config
             total_loss = (

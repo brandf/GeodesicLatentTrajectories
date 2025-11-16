@@ -127,13 +127,15 @@ wait "$DATASET_DOWNLOAD_PID"
 trap - EXIT
 
 BASE_TRAIN_CMD=(
-    python -m scripts.base_train --
+    python -m scripts.base_train
     --depth="$DEPTH"
     --max_seq_len="$MAX_SEQ_LEN"
     --device_batch_size="$DEVICE_BATCH_SIZE"
     --total_batch_size="$EFFECTIVE_TOTAL_BATCH"
     --target_flops="$TARGET_FLOPS"
     --run="$WANDB_RUN"
+    --eval_every=200
+    --log_every=20
 )
 if (( ENABLE_GLT )); then
     BASE_TRAIN_CMD+=(--enable_glt=True)

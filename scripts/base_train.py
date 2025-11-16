@@ -66,6 +66,7 @@ sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+log_every = 100 # how often to log train metrics (CE loss) to wandb
 # Geodesic Latent Trajectories (optional)
 enable_glt = False
 glt_norm_eps = 1e-8
@@ -75,6 +76,7 @@ glt_lambda_local = 0.3
 glt_lambda_global = 0.05
 glt_lambda_angle = 0.1
 glt_lambda_bi = 0.1
+glt_lambda_scale = 0.3 # downscale GLT penalties for small-budget runs
 glt_global_num_spans = 1
 glt_global_span_len = 256
 # Visualization
@@ -142,15 +144,19 @@ if resuming:
 
 glt_config_kwargs = None
 if enable_glt:
+    scaled_lambda_local = glt_lambda_local * glt_lambda_scale
+    scaled_lambda_global = glt_lambda_global * glt_lambda_scale
+    scaled_lambda_angle = glt_lambda_angle * glt_lambda_scale
+    scaled_lambda_bi = glt_lambda_bi * glt_lambda_scale
     glt_config_kwargs = GLTConfig(
         enabled=True,
         norm_eps=glt_norm_eps,
         clamp_eps=glt_clamp_eps,
         lambda_ce=glt_lambda_ce,
-        lambda_local=glt_lambda_local,
-        lambda_global=glt_lambda_global,
-        lambda_angle=glt_lambda_angle,
-        lambda_bi=glt_lambda_bi,
+        lambda_local=scaled_lambda_local,
+        lambda_global=scaled_lambda_global,
+        lambda_angle=scaled_lambda_angle,
+        lambda_bi=scaled_lambda_bi,
         global_num_spans=glt_global_num_spans,
         global_span_len=glt_global_span_len,
     ).to_dict()
@@ -181,6 +187,7 @@ user_config["glt_lambda_local"] = glt_config.lambda_local if glt_config else glt
 user_config["glt_lambda_global"] = glt_config.lambda_global if glt_config else glt_lambda_global
 user_config["glt_lambda_angle"] = glt_config.lambda_angle if glt_config else glt_lambda_angle
 user_config["glt_lambda_bi"] = glt_config.lambda_bi if glt_config else glt_lambda_bi
+user_config["glt_lambda_scale"] = glt_lambda_scale
 user_config["glt_global_num_spans"] = glt_config.global_num_spans if glt_config else glt_global_num_spans
 user_config["glt_global_span_len"] = glt_config.global_span_len if glt_config else glt_global_span_len
 user_config["viz_enabled"] = viz_enabled
@@ -297,13 +304,15 @@ def get_muon_momentum(it):
 if not resuming:
     step = 0
     min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
+    smooth_total_loss = 0 # EMA of total (optimization) loss
+    smooth_ce_loss = 0 # EMA of baseline CE loss
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
     min_val_bpb = loop_state["min_val_bpb"]
-    smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_total_loss = loop_state.get("smooth_total_loss", loop_state.get("smooth_train_loss", 0))
+    smooth_ce_loss = loop_state.get("smooth_ce_loss", smooth_total_loss)
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
@@ -327,7 +336,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -343,7 +352,7 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -385,7 +394,8 @@ while True:
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
+                    "smooth_total_loss": smooth_total_loss,
+                    "smooth_ce_loss": smooth_ce_loss,
                     "total_training_time": total_training_time,
                 },
             },
@@ -401,9 +411,10 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    glt_breakdown_acc = {} if glt_config else None
+    loss_breakdown_acc = {} if glt_config else None
     need_viz_data = viz_cfg.needs_batch_data(step)
     viz_batch_data = None
+    last_ce_loss = None
     for micro_step in range(grad_accum_steps):
         model_kwargs = {}
         if glt_config:
@@ -422,9 +433,13 @@ while True:
             breakdown = None
             visuals = None
         train_loss = loss.detach() # for logging
-        if breakdown is not None and glt_breakdown_acc is not None:
-            for k, v in breakdown.items():
-                glt_breakdown_acc[k] = glt_breakdown_acc.get(k, 0.0) + float(v.detach().cpu())
+        if breakdown is not None:
+            if loss_breakdown_acc is not None:
+                for k, v in breakdown.items():
+                    loss_breakdown_acc[k] = loss_breakdown_acc.get(k, 0.0) + float(v.detach().cpu())
+            ce_component = breakdown.get("ce")
+            if ce_component is not None:
+                last_ce_loss = ce_component.detach()
         if visuals is not None and viz_batch_data is None:
             viz_batch_data = VizBatch(
                 latents=visuals["latents"],
@@ -434,9 +449,9 @@ while True:
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    glt_breakdown_avg = None
-    if glt_breakdown_acc is not None and glt_breakdown_acc:
-        glt_breakdown_avg = {k: v / grad_accum_steps for k, v in glt_breakdown_acc.items()}
+    loss_breakdown_avg = None
+    if loss_breakdown_acc is not None and loss_breakdown_acc:
+        loss_breakdown_avg = {k: v / grad_accum_steps for k, v in loss_breakdown_acc.items()}
     # gradient clipping
     grad_clip_enabled = grad_clip > 0.0
     if grad_clip_enabled:
@@ -460,8 +475,12 @@ while True:
 
     # logging
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    train_total_loss_val = train_loss.item()
+    train_ce_loss_val = last_ce_loss.item() if last_ce_loss is not None else train_total_loss_val
+    smooth_total_loss = ema_beta * smooth_total_loss + (1 - ema_beta) * train_total_loss_val
+    smooth_ce_loss = ema_beta * smooth_ce_loss + (1 - ema_beta) * train_ce_loss_val
+    debiased_total_loss = smooth_total_loss / (1 - ema_beta**(step + 1))
+    debiased_ce_loss = smooth_ce_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -471,27 +490,36 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     glt_print = ""
-    if glt_breakdown_avg:
-        glt_parts = ", ".join(f"{k}={v:.4f}" for k, v in glt_breakdown_avg.items())
-        glt_print = f" | glt[{glt_parts}]"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m{glt_print}")
-    if step % 100 == 0:
+    if glt_config and loss_breakdown_avg:
+        glt_parts = ", ".join(
+            f"{k}={v:.4f}" for k, v in loss_breakdown_avg.items() if k.startswith("glt/")
+        )
+        if glt_parts:
+            glt_print = f" | glt[{glt_parts}]"
+    if glt_config:
+        loss_text = f"loss_ce: {debiased_ce_loss:.6f} | loss_total: {debiased_total_loss:.6f}"
+    else:
+        loss_text = f"loss: {debiased_total_loss:.6f}"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | {loss_text} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m{glt_print}")
+    if log_every > 0 and step % log_every == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
+            "train/loss": debiased_ce_loss,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
         }
+        if glt_config:
+            log_data["glt/loss"] = debiased_total_loss
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
-        if glt_breakdown_avg:
-            for metric_name, metric_value in glt_breakdown_avg.items():
+        if loss_breakdown_avg:
+            for metric_name, metric_value in loss_breakdown_avg.items():
                 log_data[f"loss_components/{metric_name}"] = metric_value
-        wandb_run.log(log_data)
+        wandb_run.log(log_data, step=step)
     if viz_cfg.needs_batch_data(step) and viz_batch_data is not None:
         maybe_log_visualizations(step, viz_cfg, viz_batch_data, wandb_run)
 
