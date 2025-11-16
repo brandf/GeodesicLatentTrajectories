@@ -71,6 +71,8 @@ token_ids → input embeddings → Transformer → raw hidden states h_t
                                         ↓
                           latent points y_t ∈ S^{D-1}
                                         ↓
+                geodesic extrapolation (y_t , y_{t-1}) → \hat{y}_{t+1}
+                                        ↓
                    prediction head → logits → token loss
 `
 
@@ -248,26 +250,23 @@ Recommended starting weights:
 
 ## 6. Extrapolation for Next‑Token Prediction
 
-Given final latent point \(y_T\):
+Every GLT forward pass predicts the next token by extending the latent trajectory:
 
-1. Compute tangent direction  
+1. For each timestep \(t \ge 1\), compute the tangent pointing away from the previous latent:
    \[
-   v_T = \log_{y_{T-1}}(y_T)
+   v_t = -\log_{y_t}(y_{t-1})
    \]
-
-2. Extrapolate forward:
-
+2. Extrapolate one step along the geodesic:
    \[
-   y_{T+1} = \exp_{y_T}(v_T)
+   \hat{y}_{t+1} = \exp_{y_t}(v_t)
    \]
-
-3. Decode via vocab projection:
-
+3. Feed the extrapolated latent into the vocab projection:
    \[
-   	ext{logits}_{T+1} = V y_{T+1} + c
+   	ext{logits}_{t+1} = V \hat{y}_{t+1} + c
    \]
+4. The first prediction (BOS → token\(_1\)) falls back to \(y_0\) because no previous latent exists.
 
-This yields predictions consistent with geodesic continuation.
+Training, evaluation, and autoregressive inference all share this extrapolation path so the CE loss is defined in the geodesically “untangled” space.
 
 ---
 

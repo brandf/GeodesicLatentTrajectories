@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from glt.config import GLTConfig
-from glt.geometry import normalize as glt_normalize
+from glt.geometry import normalize as glt_normalize, log_map as glt_log_map, exp_map as glt_exp_map
 from glt.losses import (
     angular_spacing_loss,
     bidirectional_midpoint_loss,
@@ -214,6 +214,25 @@ class GPT(nn.Module):
         # Temporarily disable hyperspherical normalization so GLT path matches baseline
         return hidden
 
+    def _extrapolate_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Geodesically extrapolate the latent trajectory so each timestep predicts the next token.
+        The first position falls back to the original latent because we lack sufficient history.
+        """
+        B, T, D = latents.shape
+        if T < 2:
+            return latents
+        work_dtype = torch.float32 if latents.dtype in (torch.float16, torch.bfloat16) else latents.dtype
+        normalized = glt_normalize(latents.to(work_dtype), eps=self.glt_config.norm_eps)
+        prev = normalized[:, :-1, :]
+        curr = normalized[:, 1:, :]
+        tangent = glt_log_map(curr, prev, eps=self.glt_config.clamp_eps)
+        forward = -tangent
+        predicted = torch.empty_like(normalized)
+        predicted[:, 0, :] = normalized[:, 0, :]
+        predicted[:, 1:, :] = glt_exp_map(curr, forward, eps=self.glt_config.clamp_eps)
+        return predicted.to(dtype=latents.dtype)
+
     def _build_valid_mask(self, targets: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if targets is None:
             return None
@@ -303,8 +322,12 @@ class GPT(nn.Module):
         latents = self._project_latents(x)
 
         # Forward the lm_head (compute logits)
+        if self._glt_enabled:
+            logits_latents = self._extrapolate_latents(latents)
+        else:
+            logits_latents = latents
         softcap = 15
-        logits = self.lm_head(latents)
+        logits = self.lm_head(logits_latents)
         logits = softcap * torch.tanh(logits / softcap) # logits softcap
         if targets is None:
             return logits

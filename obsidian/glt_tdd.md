@@ -18,7 +18,7 @@ It assumes the reader has the **PRD** (`glt_prd.md`) and **Math Appendix** (`glt
    - angular spacing loss
    - bi-directional midpoint loss
 4. Wire these losses into the training loop with configurable weights.
-5. Provide hooks for **extrapolative decoding** (geodesic continuation) for generation experiments.
+5. Implement **extrapolative decoding** (geodesic continuation) as the default next-token predictor.
 6. Provide minimal visualization/debug tools for latent trajectories.
 
 The first milestone only requires training and evaluating a model with GLT loss while still doing standard next-token prediction from latent points.
@@ -53,7 +53,8 @@ input_ids
   → transformer blocks
   → hidden states h_t ∈ ℝ^H
   → L2 normalization: h_t → y_t ∈ S^{D-1}
-  → vocab projection: y_t → logits_t ∈ ℝ^{V}
+  → geodesic extrapolation: (y_t, y_{t-1}) → ŷ_{t+1}
+  → vocab projection: ŷ_{t+1} → logits_t ∈ ℝ^{V}
   → CE loss with target x_{t+1}
 
 Also:
@@ -528,7 +529,6 @@ def extrapolate_next_latent(y_seq: torch.Tensor,
    - Config/CLI, logging for all GLT loss terms.
 6. Optional:
    - Visualization utilities for angle histograms and midpoint errors.
-   - Extrapolative decoding helper.
 
 ---
 
@@ -546,4 +546,4 @@ The core components are:
 
 - a hyperspherical normalization stage that simply L2-normalizes transformer states,
 - Riemannian-inspired losses that encourage locally straight, globally coherent trajectories,
-- and latent-based decoding (with an optional extrapolative mode) built on those trajectories.
+- and latent-based decoding that extrapolates the trajectory before producing logits so next-token prediction happens in the untangled space.
