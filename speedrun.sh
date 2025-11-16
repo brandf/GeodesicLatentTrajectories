@@ -3,6 +3,37 @@
 # This script is the "Best ChatGPT clone that $100 can buy",
 # It is designed to run in ~4 hours on 8XH100 node at $3/GPU/hour.
 
+usage() {
+    cat <<'EOF'
+Usage: bash speedrun.sh [--glt]
+
+Optional flags:
+  --glt        Enable Geodesic Latent Trajectories losses during base training.
+EOF
+}
+
+ENABLE_GLT=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --glt)
+            ENABLE_GLT=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+if (( ENABLE_GLT )); then
+    echo "[speedrun] GLT enabled (will pass --enable_glt=True to base pretraining)."
+fi
+
 # 1) Example launch (simplest):
 # bash speedrun.sh
 # 2) Example launch in a screen session (because the run takes ~4 hours):
@@ -84,9 +115,13 @@ wait $DATASET_DOWNLOAD_PID
 
 # Number of processes/GPUs to use
 NPROC_PER_NODE=8
+GLT_ARGS=()
+if (( ENABLE_GLT )); then
+    GLT_ARGS+=(--enable_glt=True)
+fi
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN "${GLT_ARGS[@]}"
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 # evaluate the model on CORE tasks

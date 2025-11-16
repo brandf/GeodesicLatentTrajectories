@@ -13,11 +13,13 @@ Usage: bash run10.sh [--gpu 5090|h100] [base_train_overrides...]
 
 The optional base_train_overrides are forwarded verbatim to
 `python -m scripts.base_train` after the default $10 profile flags.
+Pass --glt to enable Geodesic Latent Trajectories losses during training.
 EOF
 }
 
 GPU_CHOICE="5090"
 BASE_TRAIN_OVERRIDES=()
+ENABLE_GLT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,6 +34,10 @@ while [[ $# -gt 0 ]]; do
         --gpu=*)
             GPU_CHOICE="${1#*=}"
             GPU_CHOICE="${GPU_CHOICE,,}"
+            shift
+            ;;
+        --glt)
+            ENABLE_GLT=1
             shift
             ;;
         -h|--help)
@@ -81,6 +87,9 @@ echo "[run10] grad_accum_steps=$GRAD_ACCUM_STEPS, effective_total_batch=${EFFECT
 if (( EFFECTIVE_TOTAL_BATCH != TARGET_TOTAL_BATCH )); then
     echo "[run10] note: total batch rounded from $TARGET_TOTAL_BATCH to $EFFECTIVE_TOTAL_BATCH to maintain integer grad accumulation"
 fi
+if (( ENABLE_GLT )); then
+    echo "[run10] GLT enabled (will pass --enable_glt=True to base_train)"
+fi
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
@@ -126,6 +135,9 @@ BASE_TRAIN_CMD=(
     --target_flops="$TARGET_FLOPS"
     --run="$WANDB_RUN"
 )
+if (( ENABLE_GLT )); then
+    BASE_TRAIN_CMD+=(--enable_glt=True)
+fi
 BASE_TRAIN_CMD+=("${BASE_TRAIN_OVERRIDES[@]}")
 "${BASE_TRAIN_CMD[@]}"
 

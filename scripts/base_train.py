@@ -13,12 +13,14 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import json
 import time
 from contextlib import nullcontext
 
 import wandb
 import torch
 
+from glt.config import GLTConfig
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -62,6 +64,17 @@ sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+# Geodesic Latent Trajectories (optional)
+enable_glt = False
+glt_norm_eps = 1e-8
+glt_clamp_eps = 1e-6
+glt_lambda_ce = 1.0
+glt_lambda_local = 0.3
+glt_lambda_global = 0.05
+glt_lambda_angle = 0.1
+glt_lambda_bi = 0.1
+glt_global_num_spans = 1
+glt_global_span_len = 256
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -107,24 +120,81 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # -----------------------------------------------------------------------------
+# Checkpoint / GLT configuration
+base_dir = get_base_dir()
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+resuming = resume_from_step != -1
+model_data = None
+optimizer_data = None
+meta_data = None
+if resuming:
+    print0(f"Resuming optimization from step {resume_from_step}")
+    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+
+glt_config_kwargs = None
+if enable_glt:
+    glt_config_kwargs = GLTConfig(
+        enabled=True,
+        norm_eps=glt_norm_eps,
+        clamp_eps=glt_clamp_eps,
+        lambda_ce=glt_lambda_ce,
+        lambda_local=glt_lambda_local,
+        lambda_global=glt_lambda_global,
+        lambda_angle=glt_lambda_angle,
+        lambda_bi=glt_lambda_bi,
+        global_num_spans=glt_global_num_spans,
+        global_span_len=glt_global_span_len,
+    ).to_dict()
+if resuming and meta_data is not None:
+    saved_glt = meta_data.get("glt_config", None)
+    if saved_glt is None and enable_glt:
+        print0("[GLT] Checkpoint does not contain GLT metadata; disabling GLT for resume.")
+    glt_config_kwargs = saved_glt
+glt_config = GLTConfig(**glt_config_kwargs) if glt_config_kwargs else None
+if glt_config:
+    print0(f"[GLT] Enabled with config: {glt_config_kwargs}")
+else:
+    print0("[GLT] Disabled")
+user_config["enable_glt"] = bool(glt_config)
+user_config["glt_norm_eps"] = glt_config.norm_eps if glt_config else glt_norm_eps
+user_config["glt_clamp_eps"] = glt_config.clamp_eps if glt_config else glt_clamp_eps
+user_config["glt_lambda_ce"] = glt_config.lambda_ce if glt_config else glt_lambda_ce
+user_config["glt_lambda_local"] = glt_config.lambda_local if glt_config else glt_lambda_local
+user_config["glt_lambda_global"] = glt_config.lambda_global if glt_config else glt_lambda_global
+user_config["glt_lambda_angle"] = glt_config.lambda_angle if glt_config else glt_lambda_angle
+user_config["glt_lambda_bi"] = glt_config.lambda_bi if glt_config else glt_lambda_bi
+user_config["glt_global_num_spans"] = glt_config.global_num_spans if glt_config else glt_global_num_spans
+user_config["glt_global_span_len"] = glt_config.global_span_len if glt_config else glt_global_span_len
+if not use_dummy_wandb:
+    wandb_run.config.update(
+        {k: user_config[k] for k in [
+            "enable_glt",
+            "glt_norm_eps",
+            "glt_clamp_eps",
+            "glt_lambda_ce",
+            "glt_lambda_local",
+            "glt_lambda_global",
+            "glt_lambda_angle",
+            "glt_lambda_bi",
+            "glt_global_num_spans",
+            "glt_global_span_len",
+        ]},
+        allow_val_change=True,
+    )
+
+# -----------------------------------------------------------------------------
 # Initialize the Model
 
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    model = GPT(model_config, glt_config=glt_config)
 model.to_empty(device=device)
 model.init_weights()
 
-# If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -168,7 +238,7 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 tokens_dir = os.path.join(base_dir, "tokenized_data")
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+dataloader_resume_state_dict = None if not resuming else meta_data.get("dataloader_state_dict")
 train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
@@ -281,6 +351,7 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
+                "glt_config": glt_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": device_batch_size,
                 "max_seq_len": max_seq_len,
@@ -303,13 +374,24 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    glt_breakdown_acc = {} if glt_config else None
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            if glt_config:
+                loss, breakdown = model(x, y, return_loss_breakdown=True)
+            else:
+                loss = model(x, y)
+                breakdown = None
         train_loss = loss.detach() # for logging
+        if breakdown is not None and glt_breakdown_acc is not None:
+            for k, v in breakdown.items():
+                glt_breakdown_acc[k] = glt_breakdown_acc.get(k, 0.0) + float(v.detach().cpu())
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    glt_breakdown_avg = None
+    if glt_breakdown_acc is not None and glt_breakdown_acc:
+        glt_breakdown_avg = {k: v / grad_accum_steps for k, v in glt_breakdown_acc.items()}
     # gradient clipping
     grad_clip_enabled = grad_clip > 0.0
     if grad_clip_enabled:
@@ -343,7 +425,11 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    glt_print = ""
+    if glt_breakdown_avg:
+        glt_parts = ", ".join(f"{k}={v:.4f}" for k, v in glt_breakdown_avg.items())
+        glt_print = f" | glt[{glt_parts}]"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m{glt_print}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -357,6 +443,9 @@ while True:
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
+        if glt_breakdown_avg:
+            for metric_name, metric_value in glt_breakdown_avg.items():
+                log_data[f"loss_components/{metric_name}"] = metric_value
         wandb_run.log(log_data)
 
     # state update
@@ -371,6 +460,7 @@ print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 from nanochat.report import get_report
 get_report().log(section="Base model training", data=[
     user_config, # CLI args
+    {"GLT config": glt_config_kwargs or "disabled"},
     { # stats about the training setup
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",

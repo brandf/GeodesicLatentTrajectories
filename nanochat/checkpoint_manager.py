@@ -12,6 +12,7 @@ from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
+from glt.config import GLTConfig, glt_config_from_dict
 
 # Set up logging
 setup_default_logging()
@@ -74,9 +75,10 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
+    glt_config = glt_config_from_dict(meta_data.get("glt_config"))
     model_config = GPTConfig(**model_config_kwargs)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = GPT(model_config, glt_config=glt_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init

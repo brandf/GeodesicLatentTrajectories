@@ -14,11 +14,20 @@ Notable features:
 import math
 from functools import partial
 from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from glt.config import GLTConfig
+from glt.geometry import normalize as glt_normalize
+from glt.losses import (
+    angular_spacing_loss,
+    bidirectional_midpoint_loss,
+    global_straightness_loss,
+    local_midpoint_loss,
+)
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
@@ -136,9 +145,11 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, glt_config: Optional[GLTConfig] = None):
         super().__init__()
         self.config = config
+        self.glt_config = glt_config if glt_config and glt_config.enabled else None
+        self._glt_enabled = self.glt_config is not None
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
@@ -199,6 +210,37 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
+    def _project_latents(self, hidden: torch.Tensor) -> torch.Tensor:
+        if not self._glt_enabled:
+            return hidden
+        return glt_normalize(hidden, eps=self.glt_config.norm_eps)
+
+    def _build_valid_mask(self, targets: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if targets is None or not self._glt_enabled:
+            return None
+        mask = targets >= 0
+        if torch.all(mask):
+            return None
+        return mask
+
+    def _compute_glt_losses(self, latents: torch.Tensor, mask: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        assert self.glt_config is not None
+        cfg = self.glt_config
+        eps = cfg.clamp_eps
+        losses = {
+            "local": local_midpoint_loss(latents, mask=mask, eps=eps),
+            "global": global_straightness_loss(
+                latents,
+                mask=mask,
+                num_spans=cfg.global_num_spans,
+                span_len=cfg.global_span_len,
+                eps=eps,
+            ),
+            "angle": angular_spacing_loss(latents, mask=mask, eps=eps),
+            "bi": bidirectional_midpoint_loss(latents, mask=mask, eps=eps),
+        }
+        return losses
+
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -241,7 +283,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_loss_breakdown=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -258,22 +300,39 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
+        latents = self._project_latents(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15
-        if targets is not None:
-            # training mode: compute and return the loss
-            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference mode: compute and return the logits
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+        logits = self.lm_head(latents)
+        logits = softcap * torch.tanh(logits / softcap) # logits softcap
+        if targets is None:
             return logits
+        logits = logits.float() # use tf32/fp32 for logits
+        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        if loss_reduction == 'none':
+            return ce_loss
+        if not self._glt_enabled:
+            if return_loss_breakdown:
+                return ce_loss, {"ce": ce_loss.detach()}
+            return ce_loss
+        latents_for_loss = latents.float()
+        mask = self._build_valid_mask(targets)
+        glt_losses = self._compute_glt_losses(latents_for_loss, mask)
+        cfg = self.glt_config
+        total_loss = (
+            cfg.lambda_ce * ce_loss
+            + cfg.lambda_local * glt_losses["local"]
+            + cfg.lambda_global * glt_losses["global"]
+            + cfg.lambda_angle * glt_losses["angle"]
+            + cfg.lambda_bi * glt_losses["bi"]
+        )
+        if return_loss_breakdown:
+            breakdown = {"ce": ce_loss.detach()}
+            for key, value in glt_losses.items():
+                breakdown[f"glt/{key}"] = value.detach()
+            return total_loss, breakdown
+        return total_loss
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

@@ -4,6 +4,37 @@
 # Designed to run end-to-end for $1000/24 ~= 41.6 hours on an 8XH100 node
 # A bit sparser on comments, see speedrun.sh for more detail
 
+usage() {
+    cat <<'EOF'
+Usage: bash run1000.sh [--glt]
+
+Optional flags:
+  --glt        Enable Geodesic Latent Trajectories losses during base training.
+EOF
+}
+
+ENABLE_GLT=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --glt)
+            ENABLE_GLT=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+if (( ENABLE_GLT )); then
+    echo "[run1000] GLT enabled (will pass --enable_glt=True to base pretraining)."
+fi
+
 # all the setup stuff
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
@@ -73,8 +104,12 @@ python -m scripts.tok_eval
 
 # Number of processes/GPUs to use
 NPROC_PER_NODE=8
+GLT_ARGS=()
+if (( ENABLE_GLT )); then
+    GLT_ARGS+=(--enable_glt=True)
+fi
 
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=32 --device_batch_size=8 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=32 --device_batch_size=8 --run=$WANDB_RUN "${GLT_ARGS[@]}"
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
 
