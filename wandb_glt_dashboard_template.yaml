@@ -1,0 +1,179 @@
+# W&B Dashboard Template for GLT
+#
+# This file describes a suggested Weights & Biases (W&B) dashboard layout
+# for monitoring Geodesic Latent Trajectories (GLT).
+#
+# It is NOT a strict W&B internal schema, but a structured template you can:
+# - check into your repo, and
+# - manually recreate as a W&B dashboard/report, or
+# - adapt into a programmatic dashboard creator using the W&B API.
+#
+# Conventions:
+# - Replace ${PROJECT_NAME} with your actual W&B project name.
+# - Replace ${RUN_FILTER} with any W&B run filters you want (tags, config, etc.).
+#
+# Each `panel` block specifies:
+# - type:      high-level W&B panel type (line, histogram, image)
+# - title:     human-readable title
+# - x:         x-axis (usually _step)
+# - y:         metric(s) to plot
+# - queries:   run filters / groups
+#
+# You can mirror this layout in a W&B Report or Dashboard.
+
+project: "${PROJECT_NAME}"
+
+run_filter:
+  # Example: only include runs with a specific config or tag
+  # expression: "config.model_name = 'glt-gpt' AND tags CONTAINS 'glt'"
+  expression: "${RUN_FILTER}"
+
+layout:
+  - section: "Overview"
+    description: "High-level losses and optimization signals."
+    panels:
+      - id: "loss_total_and_ce"
+        type: "line"
+        title: "Total Loss & CE Loss"
+        x: "_step"
+        y:
+          - "loss/total"
+          - "loss/ce"
+        options:
+          smoothing: 0.8
+          legend: true
+
+      - id: "loss_glt_components"
+        type: "line"
+        title: "GLT Loss Components"
+        x: "_step"
+        y:
+          - "loss/local"
+          - "loss/global"
+          - "loss/angle"
+          - "loss/bi"
+        options:
+          smoothing: 0.8
+          legend: true
+
+  - section: "GLT Geometry Metrics"
+    description: "Curvature, step angles, and pre-normalization radius statistics."
+    panels:
+      - id: "glt_curvature_mean_std"
+        type: "line"
+        title: "Curvature: Mean & Std"
+        x: "_step"
+        y:
+          - "glt/curvature_mean"
+          - "glt/curvature_std"
+        options:
+          smoothing: 0.8
+          legend: true
+
+      - id: "glt_angle_mean_std_var"
+        type: "line"
+        title: "Angular Steps: Mean, Std, Var"
+        x: "_step"
+        y:
+          - "glt/angle_mean"
+          - "glt/angle_std"
+          - "glt/angle_var"
+        options:
+          smoothing: 0.8
+          legend: true
+
+      - id: "glt_radius_mean_std"
+        type: "line"
+        title: "Pre-Norm Radius: Mean & Std"
+        x: "_step"
+        y:
+          - "glt/pre_norm_radius_mean"
+          - "glt/pre_norm_radius_std"
+        options:
+          smoothing: 0.8
+          legend: true
+
+  - section: "Distributions"
+    description: "Histograms of curvature, angle, and radius during training."
+    panels:
+      - id: "hist_curvature"
+        type: "histogram"
+        title: "Curvature Distribution (κ_t)"
+        metric: "glt/curvature_hist"
+        options:
+          # W&B will treat this as a histogram artifact
+          log_scale: false
+
+      - id: "hist_angle"
+        type: "histogram"
+        title: "Angle Distribution (θ_t)"
+        metric: "glt/angle_hist"
+        options:
+          log_scale: false
+
+      - id: "hist_radius"
+        type: "histogram"
+        title: "Pre-Norm Radius Distribution (||h_t||)"
+        metric: "glt/pre_norm_radius_hist"
+        options:
+          log_scale: false
+
+  - section: "Sequence Visualizations"
+    description: "Per-sequence structured visuals logged as images."
+    panels:
+      - id: "img_cosine_heatmap"
+        type: "image"
+        title: "Cosine Similarity Heatmap (Representative Sequence)"
+        metric: "viz/cosine_heatmap"
+        options:
+          caption: "C_ij = y_i · y_j"
+
+      - id: "img_curvature_trace"
+        type: "image"
+        title: "Curvature Trace (κ_t vs token index)"
+        metric: "viz/curvature_trace"
+        options:
+          caption: "Curvature along a single sequence."
+
+      - id: "img_pca_directions"
+        type: "image"
+        title: "PCA of Local Directions"
+        metric: "viz/pca_directions"
+        options:
+          caption: "Diagnostic PCA of v_t = y_{t+1} - y_t (not semantically interpreted)."
+
+  - section: "Run Comparison"
+    description: "Compare GLT behavior across different experimental settings."
+    panels:
+      - id: "compare_curvature_by_run"
+        type: "line"
+        title: "Curvature Mean Across Runs"
+        x: "_step"
+        y:
+          - "glt/curvature_mean"
+        options:
+          group_by: "run"
+          legend: true
+          smoothing: 0.8
+
+      - id: "compare_angle_mean_by_run"
+        type: "line"
+        title: "Angle Mean Across Runs"
+        x: "_step"
+        y:
+          - "glt/angle_mean"
+        options:
+          group_by: "run"
+          legend: true
+          smoothing: 0.8
+
+      - id: "compare_loss_total_by_run"
+        type: "line"
+        title: "Total Loss Across Runs"
+        x: "_step"
+        y:
+          - "loss/total"
+        options:
+          group_by: "run"
+          legend: true
+          smoothing: 0.8

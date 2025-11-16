@@ -10,6 +10,10 @@ The public surface mirrors the structure from the obsidian notes:
 from .config import GLTConfig, glt_config_from_dict
 from . import geometry
 from . import losses
+from . import metrics
+from . import logging as viz_logging
+from . import plotting
+from .viz_config import VizConfig
 from .extrapolation import extrapolate_next_latent
 
 __all__ = [
@@ -17,5 +21,9 @@ __all__ = [
     "glt_config_from_dict",
     "geometry",
     "losses",
+    "metrics",
+    "viz_logging",
+    "plotting",
+    "VizConfig",
     "extrapolate_next_latent",
 ]

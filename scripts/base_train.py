@@ -21,6 +21,8 @@ import wandb
 import torch
 
 from glt.config import GLTConfig
+from glt.viz_config import VizConfig
+from glt.logging import VizBatch, maybe_log_visualizations
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -75,6 +77,12 @@ glt_lambda_angle = 0.1
 glt_lambda_bi = 0.1
 glt_global_num_spans = 1
 glt_global_span_len = 256
+# Visualization
+viz_enabled = False
+viz_scalar_every = 10
+viz_hist_every = 500
+viz_image_every = 1000
+viz_sequence_index = 0
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -156,6 +164,15 @@ if glt_config:
     print0(f"[GLT] Enabled with config: {glt_config_kwargs}")
 else:
     print0("[GLT] Disabled")
+viz_cfg = VizConfig(
+    enabled=viz_enabled,
+    scalar_every=viz_scalar_every,
+    hist_every=viz_hist_every,
+    image_every=viz_image_every,
+    sequence_index=viz_sequence_index,
+)
+if viz_cfg.enabled:
+    print0(f"[Viz] Enabled with scalar_every={viz_cfg.scalar_every}, hist_every={viz_cfg.hist_every}, image_every={viz_cfg.image_every}")
 user_config["enable_glt"] = bool(glt_config)
 user_config["glt_norm_eps"] = glt_config.norm_eps if glt_config else glt_norm_eps
 user_config["glt_clamp_eps"] = glt_config.clamp_eps if glt_config else glt_clamp_eps
@@ -166,6 +183,11 @@ user_config["glt_lambda_angle"] = glt_config.lambda_angle if glt_config else glt
 user_config["glt_lambda_bi"] = glt_config.lambda_bi if glt_config else glt_lambda_bi
 user_config["glt_global_num_spans"] = glt_config.global_num_spans if glt_config else glt_global_num_spans
 user_config["glt_global_span_len"] = glt_config.global_span_len if glt_config else glt_global_span_len
+user_config["viz_enabled"] = viz_enabled
+user_config["viz_scalar_every"] = viz_scalar_every
+user_config["viz_hist_every"] = viz_hist_every
+user_config["viz_image_every"] = viz_image_every
+user_config["viz_sequence_index"] = viz_sequence_index
 if not use_dummy_wandb:
     wandb_run.config.update(
         {k: user_config[k] for k in [
@@ -179,6 +201,11 @@ if not use_dummy_wandb:
             "glt_lambda_bi",
             "glt_global_num_spans",
             "glt_global_span_len",
+            "viz_enabled",
+            "viz_scalar_every",
+            "viz_hist_every",
+            "viz_image_every",
+            "viz_sequence_index",
         ]},
         allow_val_change=True,
     )
@@ -375,17 +402,35 @@ while True:
     synchronize()
     t0 = time.time()
     glt_breakdown_acc = {} if glt_config else None
+    need_viz_data = viz_cfg.needs_batch_data(step)
+    viz_batch_data = None
     for micro_step in range(grad_accum_steps):
+        model_kwargs = {}
+        if glt_config:
+            model_kwargs["return_loss_breakdown"] = True
+        request_visuals = need_viz_data and viz_batch_data is None
+        if request_visuals:
+            model_kwargs["return_visuals"] = True
         with autocast_ctx:
-            if glt_config:
-                loss, breakdown = model(x, y, return_loss_breakdown=True)
-            else:
-                loss = model(x, y)
-                breakdown = None
+            out = model(x, y, **model_kwargs)
+        if isinstance(out, tuple):
+            loss, extras = out
+            breakdown = extras.get("loss_breakdown")
+            visuals = extras.get("visuals")
+        else:
+            loss = out
+            breakdown = None
+            visuals = None
         train_loss = loss.detach() # for logging
         if breakdown is not None and glt_breakdown_acc is not None:
             for k, v in breakdown.items():
                 glt_breakdown_acc[k] = glt_breakdown_acc.get(k, 0.0) + float(v.detach().cpu())
+        if visuals is not None and viz_batch_data is None:
+            viz_batch_data = VizBatch(
+                latents=visuals["latents"],
+                pre_norm=visuals["pre_norm"],
+                mask=visuals["mask"],
+            )
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -447,6 +492,8 @@ while True:
             for metric_name, metric_value in glt_breakdown_avg.items():
                 log_data[f"loss_components/{metric_name}"] = metric_value
         wandb_run.log(log_data)
+    if viz_cfg.needs_batch_data(step) and viz_batch_data is not None:
+        maybe_log_visualizations(step, viz_cfg, viz_batch_data, wandb_run)
 
     # state update
     step += 1

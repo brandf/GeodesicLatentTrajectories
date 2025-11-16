@@ -216,7 +216,7 @@ class GPT(nn.Module):
         return glt_normalize(hidden, eps=self.glt_config.norm_eps)
 
     def _build_valid_mask(self, targets: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if targets is None or not self._glt_enabled:
+        if targets is None:
             return None
         mask = targets >= 0
         if torch.all(mask):
@@ -283,7 +283,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_loss_breakdown=False):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_loss_breakdown=False, return_visuals=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -300,6 +300,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
+        pre_norm = x
         latents = self._project_latents(x)
 
         # Forward the lm_head (compute logits)
@@ -312,26 +313,35 @@ class GPT(nn.Module):
         ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
         if loss_reduction == 'none':
             return ce_loss
-        if not self._glt_enabled:
-            if return_loss_breakdown:
-                return ce_loss, {"ce": ce_loss.detach()}
-            return ce_loss
-        latents_for_loss = latents.float()
         mask = self._build_valid_mask(targets)
-        glt_losses = self._compute_glt_losses(latents_for_loss, mask)
-        cfg = self.glt_config
-        total_loss = (
-            cfg.lambda_ce * ce_loss
-            + cfg.lambda_local * glt_losses["local"]
-            + cfg.lambda_global * glt_losses["global"]
-            + cfg.lambda_angle * glt_losses["angle"]
-            + cfg.lambda_bi * glt_losses["bi"]
-        )
-        if return_loss_breakdown:
-            breakdown = {"ce": ce_loss.detach()}
-            for key, value in glt_losses.items():
-                breakdown[f"glt/{key}"] = value.detach()
-            return total_loss, breakdown
+        total_loss = ce_loss
+        breakdown = {"ce": ce_loss.detach()} if return_loss_breakdown else None
+        if self._glt_enabled:
+            latents_for_loss = latents.float()
+            glt_losses = self._compute_glt_losses(latents_for_loss, mask)
+            cfg = self.glt_config
+            total_loss = (
+                cfg.lambda_ce * ce_loss
+                + cfg.lambda_local * glt_losses["local"]
+                + cfg.lambda_global * glt_losses["global"]
+                + cfg.lambda_angle * glt_losses["angle"]
+                + cfg.lambda_bi * glt_losses["bi"]
+            )
+            if breakdown is not None:
+                for key, value in glt_losses.items():
+                    breakdown[f"glt/{key}"] = value.detach()
+        extras = {}
+        if breakdown is not None:
+            extras["loss_breakdown"] = breakdown
+        if return_visuals and targets is not None:
+            visuals = {
+                "latents": latents.detach().to(device="cpu", dtype=torch.float32),
+                "pre_norm": pre_norm.detach().to(device="cpu", dtype=torch.float32),
+                "mask": None if mask is None else mask.detach().to("cpu"),
+            }
+            extras["visuals"] = visuals
+        if extras:
+            return total_loss, extras
         return total_loss
 
     @torch.inference_mode()
