@@ -20,7 +20,7 @@ We work on the unit hypersphere
 S^{D-1} = \{ y \in \mathbb{R}^D \mid \|y\|_2 = 1 \}.
 \]
 
-All latent vectors \(y_t\) produced by the GLT head are normalized to lie on \(S^{D-1}\).
+All latent vectors \(y_t\) are obtained by hyperspherical normalization of the transformer outputs, ensuring they lie on \(S^{D-1}\).
 
 ### A.1 Geodesic distance
 

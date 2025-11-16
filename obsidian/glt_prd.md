@@ -64,24 +64,24 @@ GLT will exploit these for straightening.
 ## 3. System Architecture
 
 ### 3.1 Pipeline
-```
+`
 token_ids → input embeddings → Transformer → raw hidden states h_t
                                         ↓
-                               GLT Head f(h_t)
+                        L2 normalization ‖h_t‖_2
                                         ↓
                           latent points y_t ∈ S^{D-1}
                                         ↓
                    prediction head → logits → token loss
-```
+`
 
-### 3.2 GLT head
-A trainable projection:
+### 3.2 Hyperspherical normalization
+No trainable head is needed. The final transformer block produces the latent features, and we simply normalize them onto the hypersphere:
 
 \[
-y_t = rac{W_2\,\sigma(W_1 h_t + b_1) + b_2}{\|W_2\,\sigma(W_1 h_t+b_1)+b_2\|}
+y_t = \frac{h_t}{\|h_t\|_2 + \varepsilon}
 \]
 
-to ensure \(y_t \in S^{D-1}\).
+This keeps y_t \in S^{D-1}; the transformer itself is responsible for any straightening/projection it needs internally.
 
 ### 3.3 Untied embedding/un‑embedding
 Decoder projection:
@@ -283,7 +283,7 @@ As above.
 
 ### Training
 - Use standard GPT architecture
-- GLT head inserted after transformer blocks
+- Apply hyperspherical (L2) normalization to the final transformer hidden states
 - Decoder uses y_t instead of final hidden state
 
 ---

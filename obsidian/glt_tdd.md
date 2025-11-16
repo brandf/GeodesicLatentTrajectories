@@ -9,7 +9,7 @@ It assumes the reader has the **PRD** (`glt_prd.md`) and **Math Appendix** (`glt
 
 ## 1. Objectives (Implementation-Level)
 
-1. Add a **GLT latent head** on top of the transformer to map hidden states into a hyperspherical latent space.
+1. Add a **hyperspherical normalization stage** (simple L2 norm) on top of the transformer so the hidden states lie on the latent hypersphere.
 2. Implement the **geometric utilities** (SLERP, log/exp maps, angle computation).
 3. Implement **GLT loss components**:
    - token prediction (cross-entropy)
@@ -33,8 +33,6 @@ Proposed structure inside the nanochat fork:
 
 - `glt/geometry.py`
   - Core geometric utilities on the hypersphere.
-- `glt/head.py`
-  - `GLTHead` module: mapping from transformer hidden states to latent points on the sphere.
 - `glt/losses.py`
   - Implementation of all GLT losses.
 - `glt/config.py`
@@ -42,7 +40,7 @@ Proposed structure inside the nanochat fork:
 - `glt/visualization.py` (optional, first pass can be simple)
   - Helpers for logging angle distributions and curvature metrics.
 - Integration points:
-  - `model.py` (or equivalent) — instantiate `GLTHead` and call losses.
+  - `model.py` (or equivalent) — apply hyperspherical normalization to transformer outputs and call losses.
   - `train.py` — add GLT-related CLI flags / config entries and loss logging.
 
 ### 2.2 Data Flow
@@ -54,7 +52,7 @@ input_ids
   → token_embedding
   → transformer blocks
   → hidden states h_t ∈ ℝ^H
-  → GLTHead: h_t → y_t ∈ S^{D-1}
+  → L2 normalization: h_t → y_t ∈ S^{D-1}
   → vocab projection: y_t → logits_t ∈ ℝ^{V}
   → CE loss with target x_{t+1}
 
@@ -185,44 +183,23 @@ def exp_map(y: torch.Tensor, v: torch.Tensor, eps: float = 1e-6) -> torch.Tensor
 
 ---
 
-## 4. GLT Head Module (`glt/head.py`)
+## 4. Hyperspherical Normalization (inline)
 
 ### 4.1 Design
 
-`GLTHead` takes in transformer hidden states `h` and outputs normalized latent vectors `y`:
+Latent projection reduces to a per-token L2 normalization on the transformer output.
 
 - Input: `h` with shape `(B, T, H)`
-- Output: `y` with shape `(B, T, D)` on \(S^{D-1}\)
+- Output: `y` with the same shape, constrained to \(S^{H-1}\)
 
 ### 4.2 Implementation Sketch
 
+All that is required in the model forward pass is a single call to the shared geometry utility:
+
 ```python
-import torch
-import torch.nn as nn
 from .geometry import normalize
 
-class GLTHead(nn.Module):
-    def __init__(self, hidden_size: int, latent_size: int, use_mlp: bool = True):
-        super().__init__()
-        if use_mlp:
-            self.proj = nn.Sequential(
-                nn.Linear(hidden_size, latent_size),
-                nn.GELU(),
-                nn.Linear(latent_size, latent_size),
-            )
-        else:
-            self.proj = nn.Linear(hidden_size, latent_size)
-
-        self.out_norm_eps = 1e-8
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        '''
-        h: (B, T, H)
-        returns: y: (B, T, D) normalized
-        '''
-        y = self.proj(h)  # (B, T, D)
-        y = normalize(y, eps=self.out_norm_eps)
-        return y
+y = normalize(h, eps=glt_cfg.norm_eps)
 ```
 
 ---
@@ -374,8 +351,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GLTConfig:
-    latent_size: int = 512
-    use_mlp_head: bool = True
+    norm_eps: float = 1e-8
 
     lambda_ce: float = 1.0
     lambda_local: float = 0.3
@@ -401,8 +377,8 @@ Assume there is a `GPT`-like model with:
 
 We modify:
 
-1. Add a `GLTHead` instance.
-2. Replace the input to `lm_head` with `y` instead of `h`.
+1. Apply inline L2 normalization to the transformer outputs.
+2. Replace the input to `lm_head` with the normalized `y` instead of raw `h`.
 
 #### Example
 
@@ -412,10 +388,7 @@ class GPTWithGLT(nn.Module):
         super().__init__()
         # ... build transformer, embeddings, etc.
         self.transformer = Transformer(base_cfg)
-        self.glt_head = GLTHead(hidden_size=base_cfg.n_embd,
-                                latent_size=glt_cfg.latent_size,
-                                use_mlp=glt_cfg.use_mlp_head)
-        self.lm_head = nn.Linear(glt_cfg.latent_size, vocab_size, bias=False)
+        self.lm_head = nn.Linear(base_cfg.n_embd, vocab_size, bias=False)
 
         self.glt_cfg = glt_cfg
 
@@ -423,7 +396,7 @@ class GPTWithGLT(nn.Module):
         # idx: (B, T)
         # mask: (B, T) or None
         h = self.transformer(idx)  # (B, T, H)
-        y = self.glt_head(h)       # (B, T, D)
+        y = normalize(h, eps=self.glt_cfg.norm_eps)  # (B, T, H)
 
         logits = self.lm_head(y)   # (B, T, V)
 
@@ -543,19 +516,17 @@ def extrapolate_next_latent(y_seq: torch.Tensor,
 
 1. `glt/geometry.py`
    - `normalize`, `safe_dot`, `angle`, `slerp`, `log_map`, `exp_map`.
-2. `glt/head.py`
-   - `GLTHead` with configurable latent dimension and MLP flag.
-3. `glt/losses.py`
+2. `glt/losses.py`
    - `local_midpoint_loss`
    - `global_straightness_loss`
    - `angular_spacing_loss`
-4. `glt/config.py`
+3. `glt/config.py`
    - `GLTConfig`.
-5. Model integration:
+4. Model integration:
    - `GPTWithGLT` (or equivalent modification).
-6. Training integration:
+5. Training integration:
    - Config/CLI, logging for all GLT loss terms.
-7. Optional:
+6. Optional:
    - Visualization utilities for angle histograms and midpoint errors.
    - Extrapolative decoding helper.
 
@@ -573,6 +544,6 @@ and
 
 The core components are:
 
-- a GLT head that projects transformer states onto a hypersphere,
+- a hyperspherical normalization stage that simply L2-normalizes transformer states,
 - Riemannian-inspired losses that encourage locally straight, globally coherent trajectories,
 - and latent-based decoding (with an optional extrapolative mode) built on those trajectories.
