@@ -1,3 +1,9 @@
+# Geodesic Latent Trajectories (GLT)
+
+This fork explores a geometric variant of nanochat where the transformer’s final hidden states are projected onto a hypersphere and trained to follow near-geodesic curves. Latent points are L2-normalized (`y_t = h_t / ||h_t||_2`) and paired with Riemannian utilities—SLERP, logarithmic/exponential maps, and optional parallel transport—to keep token trajectories smooth, straight, and extrapolatable. A suite of auxiliary losses (local and global straightness, angular spacing, bi-directional midpoint) regularizes these trajectories so that semantic flow becomes “as linear as possible” in log-map coordinates while still supporting the original next-token cross-entropy objective. The end goal is an interpretable, constant-speed latent manifold where generation can extend sequences by walking forward along the learned geodesic direction, all while retaining the full nanochat training + inference pipeline.
+
+---
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
