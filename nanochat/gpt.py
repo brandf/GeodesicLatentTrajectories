@@ -267,6 +267,7 @@ class GPT(nn.Module):
         reduction_is_none = reduction == 'none'
         ce_values: Dict[int, torch.Tensor] = {}
         total = None
+        logits_fn = lambda chunk: self._apply_head(chunk)
         for offset, weight in zip(offsets, weights_list):
             preds = self._predict_offset_latents(normalized, forward_vec, backward_vec, offset, latents_dtype)
             if offset > 0:
@@ -281,7 +282,7 @@ class GPT(nn.Module):
                 target_slice = targets
             if pred_slice.numel() == 0:
                 continue
-            logits = self._apply_head(pred_slice)
+            logits = logits_fn(pred_slice)
             logits = logits.float()
             ce = F.cross_entropy(logits.view(-1, logits.size(-1)), target_slice.reshape(-1), ignore_index=-1, reduction=reduction)
             ce_values[offset] = ce.detach()
@@ -385,11 +386,13 @@ class GPT(nn.Module):
         ce_offsets = self.glt_config.ce_offsets if self._glt_enabled else (1,)
         latents_dtype = latents.dtype
         normalized = None
+        normalized_latents_for_glt = latents
         forward_vec = None
         backward_vec = None
         if self._glt_enabled:
             work_dtype = torch.float32 if latents_dtype in (torch.float16, torch.bfloat16) else latents_dtype
             normalized = glt_normalize(latents.to(work_dtype), eps=self.glt_config.norm_eps)
+            normalized_latents_for_glt = normalized
             forward_vec = torch.zeros_like(normalized)
             backward_vec = torch.zeros_like(normalized)
             curr = normalized[:, :-1, :]
@@ -421,7 +424,7 @@ class GPT(nn.Module):
             for offset, value in ce_components.items():
                 breakdown[f"ce/{offset:+d}"] = value.detach()
         if self._glt_enabled and self.glt_config.enable_geom_losses:
-            latents_for_loss = latents.float()
+            latents_for_loss = normalized_latents_for_glt.float()
             glt_losses = self._compute_glt_losses(latents_for_loss, mask)
             cfg = self.glt_config
             total_loss = (
