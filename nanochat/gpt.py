@@ -20,6 +20,7 @@ from typing import Dict, Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from glt.config import GLTConfig
 from glt.geometry import (
@@ -273,6 +274,7 @@ class GPT(nn.Module):
         mem_debug = bool(int(os.environ.get("GLT_MEM_DEBUG", "0"))) and torch.cuda.is_available()
         def logits_fn(chunk):
             return self._apply_head(chunk)
+        inference_offset = self._select_inference_offset(offsets)
         for offset_index, (offset, weight) in enumerate(zip(offsets, weights_list)):
             preds = self._predict_offset_latents(normalized, forward_vec, backward_vec, offset, latents_dtype)
             if offset > 0:
@@ -294,17 +296,26 @@ class GPT(nn.Module):
                 ce = F.cross_entropy(logits, target_slice, ignore_index=-1, reduction='none')
             else:
                 total_tokens = pred_slice.size(0)
-                ce_accum = pred_slice.new_zeros(1, dtype=torch.float32)
-                count_accum = 0
                 chunk_len = max(1, (total_tokens + chunk_count - 1) // chunk_count)
-                for start in range(0, total_tokens, chunk_len):
-                    end = min(start + chunk_len, total_tokens)
-                    logits_chunk = logits_fn(pred_slice[start:end]).float()
+
+                def compute_ce_slice(pred_chunk, target_chunk, start_idx, end_idx):
+                    logits_chunk = logits_fn(pred_chunk).float()
                     if mem_debug:
                         torch.cuda.synchronize()
-                        print(f"[GLT CE] offset={offset:+d} chunk={start}:{end} mem={torch.cuda.max_memory_allocated()/1e9:.2f}GB")
-                    targets_chunk = target_slice[start:end]
-                    ce_chunk = F.cross_entropy(logits_chunk, targets_chunk, ignore_index=-1, reduction='sum')
+                        print(f"[GLT CE] offset={offset:+d} chunk={start_idx}:{end_idx} mem={torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+                    return F.cross_entropy(logits_chunk, target_chunk, ignore_index=-1, reduction='sum')
+
+                ce_accum = pred_slice.new_zeros(1, dtype=torch.float32)
+                count_accum = 0
+                for start in range(0, total_tokens, chunk_len):
+                    end = min(start + chunk_len, total_tokens)
+                    pred_chunk = pred_slice[start:end]
+                    target_chunk = target_slice[start:end]
+                    use_checkpoint = True
+                    if use_checkpoint:
+                        ce_chunk = checkpoint(lambda pc, tc: compute_ce_slice(pc, tc, start, end), pred_chunk, target_chunk, use_reentrant=False)
+                    else:
+                        ce_chunk = compute_ce_slice(pred_chunk, target_chunk, start, end)
                     ce_accum += ce_chunk
                     count_accum += (end - start)
                 if reduction == 'mean':
