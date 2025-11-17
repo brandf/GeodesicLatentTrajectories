@@ -69,6 +69,14 @@ def log_map(base: Tensor, target: Tensor, eps: float = 1e-6) -> Tensor:
     dtype = _promote_dtype(base, target)
     base = normalize(base.to(dtype))
     target = normalize(target.to(dtype))
+    return log_map_normalized(base, target, eps=eps)
+
+
+def log_map_normalized(base: Tensor, target: Tensor, eps: float = 1e-6) -> Tensor:
+    """Log map assuming ``base`` and ``target`` are already unit vectors."""
+    dtype = _promote_dtype(base, target)
+    base = base.to(dtype)
+    target = target.to(dtype)
     cos_theta = safe_dot(base, target, eps=eps).unsqueeze(-1)
     theta = torch.arccos(cos_theta.clamp(-1.0 + eps, 1.0 - eps))
     sin_theta = torch.sin(theta).clamp_min(eps)
@@ -84,6 +92,14 @@ def exp_map(base: Tensor, tangent: Tensor, eps: float = 1e-6) -> Tensor:
     dtype = _promote_dtype(base, tangent)
     base = normalize(base.to(dtype))
     tangent = tangent.to(dtype)
+    return exp_map_normalized(base, tangent, eps=eps)
+
+
+def exp_map_normalized(base: Tensor, tangent: Tensor, eps: float = 1e-6) -> Tensor:
+    """Exponential map assuming ``base`` is already normalized."""
+    dtype = _promote_dtype(base, tangent)
+    base = base.to(dtype)
+    tangent = tangent.to(dtype)
     norm = torch.linalg.norm(tangent, dim=-1, keepdim=True)
     clamp_norm = norm.clamp_min(eps)
     direction = tangent / clamp_norm
@@ -97,7 +113,9 @@ def exp_map(base: Tensor, tangent: Tensor, eps: float = 1e-6) -> Tensor:
 __all__ = [
     "angle",
     "exp_map",
+    "exp_map_normalized",
     "log_map",
+    "log_map_normalized",
     "normalize",
     "safe_dot",
     "slerp",

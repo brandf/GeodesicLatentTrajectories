@@ -102,10 +102,18 @@ We use multiple loss components:
 
 ---
 
-### 4.1 Token Prediction Loss (standard cross‑entropy)
+### 4.1 Multi-Offset Cross-Entropy
 \[
-\mathcal{L}_{	ext{CE}} = -\log p(x_{t+1}\mid y_t)
+\mathcal{L}_{	ext{CE}} = \sum_{k \in \mathcal{K}} \lambda_k \, \mathbb{E}_t\!\left[-\log p(x_{t+k} \mid \hat{y}_{t+k})\right]
 \]
+where \( \mathcal{K} = \{-K,\ldots,-1,0,+1,\ldots,+K\} \) is a set of offsets (e.g. \(K=2\)).  
+For each offset we extrapolate forward or backward using the appropriate tangent:
+
+- Forward extrapolation uses the geodesic derived from \((y_t, y_{t-1})\).
+- Backward extrapolation uses the tangent from \((y_t, y_{t+1})\).
+- Offset \(0\) reconstructs the current token directly from \(y_t\).
+
+These CE terms force the latent trajectory to stay locally linear in both directions and enable single-pass multi-step prediction for inference (tree rollouts, burst decoding, etc.). Boundary positions mask invalid offsets so no loss is applied when a neighbor does not exist.
 
 ---
 
@@ -231,20 +239,20 @@ Helps stabilize local curvature.
 
 \[
 \mathcal{L} = 
-\lambda_{	ext{CE}} \mathcal{L}_{	ext{CE}}
-+ \lambda_{	ext{local}}\mathcal{L}_{	ext{local}}
-+ \lambda_{	ext{global}}\mathcal{L}_{	ext{global}}
-+ \lambda_{	ext{angle}}\mathcal{L}_{	ext{angle}}
-+ \lambda_{	ext{bi}}\mathcal{L}_{	ext{bi}}
+ \sum_{k \in \mathcal{K}} \lambda_k \mathcal{L}_{	ext{CE}, k}
+ + \lambda_{	ext{local}}\mathcal{L}_{	ext{local}}
+ + \lambda_{	ext{global}}\mathcal{L}_{	ext{global}}
+ + \lambda_{	ext{angle}}\mathcal{L}_{	ext{angle}}
+ + \lambda_{	ext{bi}}\mathcal{L}_{	ext{bi}}
 \]
 
 Recommended starting weights:
 
-- \(\lambda_{	ext{CE}} = 1.0\)  
-- \(\lambda_{	ext{local}} = 0.3\)
+- \(\lambda_{k} = 1.0\) for all \(k \in \{-2,-1,0,+1,+2\}\) (can be decayed for large |k|)
+- \(\lambda_{	ext{local}} = 0.2\)
 - \(\lambda_{	ext{global}} = 0.05\)
-- \(\lambda_{	ext{angle}} = 0.1\)
-- \(\lambda_{	ext{bi}} = 0.1\)
+- \(\lambda_{	ext{angle}} = 0.05\)
+- \(\lambda_{	ext{bi}} = 0.05\)
 
 ---
 
@@ -297,6 +305,11 @@ As above.
    - curvature over sequence  
    - angle distributions  
    - latent trajectory plots (PCA/UMAP)  
+
+### Future Directions
+1. **Multi-offset sweeps**: explore larger |k| values (beyond ±2) and non-uniform λ_k schedules to balance stability and rollout depth.
+2. **Tree inference**: sample multiple tangents per timestep to create branching rollouts (burst decoding) and evaluate diversity/quality trade-offs.
+3. **Curriculum weighting**: gradually ramp λ_k from short to long offsets so the model stabilizes local behavior before optimizing distant predictions.
 
 ---
 

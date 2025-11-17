@@ -14,14 +14,18 @@ Notable features:
 import math
 from functools import partial
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from glt.config import GLTConfig
-from glt.geometry import normalize as glt_normalize, log_map as glt_log_map, exp_map as glt_exp_map
+from glt.geometry import (
+    normalize as glt_normalize,
+    log_map_normalized as glt_log_map_norm,
+    exp_map_normalized as glt_exp_map_norm,
+)
 from glt.losses import (
     angular_spacing_loss,
     bidirectional_midpoint_loss,
@@ -214,24 +218,81 @@ class GPT(nn.Module):
         # Temporarily disable hyperspherical normalization so GLT path matches baseline
         return hidden
 
-    def _extrapolate_latents(self, latents: torch.Tensor) -> torch.Tensor:
+    def _build_offset_predictions(self, latents: torch.Tensor, offsets: Tuple[int, ...]) -> Dict[int, torch.Tensor]:
         """
-        Geodesically extrapolate the latent trajectory so each timestep predicts the next token.
-        The first position falls back to the original latent because we lack sufficient history.
+        Produce extrapolated latents for every offset in `offsets`.
+        Offsets > 0 step forward, offsets < 0 step backward, 0 reconstructs the current latent.
         """
-        B, T, D = latents.shape
-        if T < 2:
-            return latents
-        work_dtype = torch.float32 if latents.dtype in (torch.float16, torch.bfloat16) else latents.dtype
-        normalized = glt_normalize(latents.to(work_dtype), eps=self.glt_config.norm_eps)
-        prev = normalized[:, :-1, :]
-        curr = normalized[:, 1:, :]
-        tangent = glt_log_map(curr, prev, eps=self.glt_config.clamp_eps)
-        forward = -tangent
-        predicted = torch.empty_like(normalized)
-        predicted[:, 0, :] = normalized[:, 0, :]
-        predicted[:, 1:, :] = glt_exp_map(curr, forward, eps=self.glt_config.clamp_eps)
-        return predicted.to(dtype=latents.dtype)
+        dtype_work = torch.float32 if latents.dtype in (torch.float16, torch.bfloat16) else latents.dtype
+        normalized = glt_normalize(latents.to(dtype_work), eps=self.glt_config.norm_eps)
+        eps = self.glt_config.clamp_eps
+        forward_vec = torch.zeros_like(normalized)
+        curr = normalized[:, :-1, :]
+        next_lat = normalized[:, 1:, :]
+        forward_vec[:, :-1, :] = glt_log_map_norm(curr, next_lat, eps=eps)
+        backward_vec = torch.zeros_like(normalized)
+        prev_lat = normalized[:, :-1, :]
+        backward_curr = normalized[:, 1:, :]
+        backward_vec[:, 1:, :] = glt_log_map_norm(backward_curr, prev_lat, eps=eps)
+        preds: Dict[int, torch.Tensor] = {}
+        for offset in offsets:
+            if offset == 0:
+                pred = normalized
+            elif offset > 0:
+                pred = glt_exp_map_norm(normalized, forward_vec * float(offset), eps=eps)
+            else:
+                pred = glt_exp_map_norm(normalized, backward_vec * float(-offset), eps=eps)
+            preds[offset] = pred.to(dtype=latents.dtype)
+        return preds
+
+    @staticmethod
+    def _select_inference_offset(offsets: Tuple[int, ...]) -> int:
+        positives = sorted([o for o in offsets if o > 0])
+        if positives:
+            return positives[0]
+        if 0 in offsets:
+            return 0
+        return offsets[0]
+
+    def _apply_head(self, latents: torch.Tensor) -> torch.Tensor:
+        softcap = 15
+        logits = self.lm_head(latents)
+        return softcap * torch.tanh(logits / softcap)
+
+    def _compute_multi_ce_loss(
+        self,
+        offset_predictions: Dict[int, torch.Tensor],
+        targets: torch.Tensor,
+        reduction: str,
+    ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+        offsets = self.glt_config.ce_offsets
+        weights = self.glt_config.ce_offset_weights
+        if weights is None:
+            weights_list = [1.0 / len(offsets)] * len(offsets)
+        else:
+            weights_list = list(weights)
+        ce_values: Dict[int, torch.Tensor] = {}
+        total = 0.0
+        for offset, weight in zip(offsets, weights_list):
+            preds = offset_predictions[offset]
+            if offset > 0:
+                pred_slice = preds[:, :-offset, :]
+                target_slice = targets[:, offset:]
+            elif offset < 0:
+                k = -offset
+                pred_slice = preds[:, k:, :]
+                target_slice = targets[:, :-k]
+            else:
+                pred_slice = preds
+                target_slice = targets
+            if pred_slice.numel() == 0:
+                continue
+            logits = self._apply_head(pred_slice)
+            logits = logits.float()
+            ce = F.cross_entropy(logits.view(-1, logits.size(-1)), target_slice.reshape(-1), ignore_index=-1, reduction=reduction)
+            ce_values[offset] = ce.detach()
+            total = total + weight * ce
+        return total, ce_values
 
     def _build_valid_mask(self, targets: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if targets is None:
@@ -322,25 +383,34 @@ class GPT(nn.Module):
         latents = self._project_latents(x)
 
         # Forward the lm_head (compute logits)
+        ce_offsets = self.glt_config.ce_offsets if self._glt_enabled else (1,)
+        offset_predictions: Dict[int, torch.Tensor] = {}
         if self._glt_enabled:
-            logits_latents = self._extrapolate_latents(latents)
+            offset_predictions = self._build_offset_predictions(latents, ce_offsets)
+            inference_offset = self._select_inference_offset(ce_offsets)
+            logits_latents = offset_predictions[inference_offset]
         else:
             logits_latents = latents
-        softcap = 15
-        logits = self.lm_head(logits_latents)
-        logits = softcap * torch.tanh(logits / softcap) # logits softcap
+        logits = self._apply_head(logits_latents) # logits softcap
         if targets is None:
             return logits
         logits = logits.float() # use tf32/fp32 for logits
-        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        ce_components: Dict[int, torch.Tensor] = {}
+        if self._glt_enabled:
+            ce_loss, ce_components = self._compute_multi_ce_loss(offset_predictions, targets, loss_reduction)
+        else:
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            ce_components[1] = ce_loss.detach()
         if loss_reduction == 'none':
             return ce_loss
         mask = self._build_valid_mask(targets)
         total_loss = ce_loss
         breakdown = {"ce": ce_loss.detach()} if return_loss_breakdown else None
-        if self._glt_enabled:
-            # Normalize latents only for GLT losses so the logits keep their original scale
-            latents_for_loss = glt_normalize(latents.float(), eps=self.glt_config.norm_eps)
+        if return_loss_breakdown:
+            for offset, value in ce_components.items():
+                breakdown[f"ce/{offset:+d}"] = value.detach()
+        if self._glt_enabled and self.glt_config.enable_geom_losses:
+            latents_for_loss = latents.float()
             glt_losses = self._compute_glt_losses(latents_for_loss, mask)
             cfg = self.glt_config
             total_loss = (

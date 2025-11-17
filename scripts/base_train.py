@@ -77,6 +77,9 @@ glt_lambda_global = 0.05
 glt_lambda_angle = 0.1
 glt_lambda_bi = 0.1
 glt_lambda_scale = 0.3 # downscale GLT penalties for small-budget runs
+glt_ce_offsets = [-1, 0, 1]
+glt_ce_offset_weights = None
+glt_enable_geom_losses = True
 glt_global_num_spans = 1
 glt_global_span_len = 256
 # Visualization
@@ -148,6 +151,11 @@ if enable_glt:
     scaled_lambda_global = glt_lambda_global * glt_lambda_scale
     scaled_lambda_angle = glt_lambda_angle * glt_lambda_scale
     scaled_lambda_bi = glt_lambda_bi * glt_lambda_scale
+    ce_offsets_tuple = tuple(int(o) for o in glt_ce_offsets)
+    ce_offset_weights_tuple = None
+    if glt_ce_offset_weights is not None:
+        assert len(glt_ce_offset_weights) == len(glt_ce_offsets), "glt_ce_offset_weights length must match glt_ce_offsets"
+        ce_offset_weights_tuple = tuple(float(w) for w in glt_ce_offset_weights)
     glt_config_kwargs = GLTConfig(
         enabled=True,
         norm_eps=glt_norm_eps,
@@ -157,6 +165,9 @@ if enable_glt:
         lambda_global=scaled_lambda_global,
         lambda_angle=scaled_lambda_angle,
         lambda_bi=scaled_lambda_bi,
+        ce_offsets=ce_offsets_tuple,
+        ce_offset_weights=ce_offset_weights_tuple,
+        enable_geom_losses=glt_enable_geom_losses,
         global_num_spans=glt_global_num_spans,
         global_span_len=glt_global_span_len,
     ).to_dict()
@@ -188,6 +199,9 @@ user_config["glt_lambda_global"] = glt_config.lambda_global if glt_config else g
 user_config["glt_lambda_angle"] = glt_config.lambda_angle if glt_config else glt_lambda_angle
 user_config["glt_lambda_bi"] = glt_config.lambda_bi if glt_config else glt_lambda_bi
 user_config["glt_lambda_scale"] = glt_lambda_scale
+user_config["glt_ce_offsets"] = list(glt_config.ce_offsets) if glt_config else glt_ce_offsets
+user_config["glt_ce_offset_weights"] = list(glt_config.ce_offset_weights) if glt_config and glt_config.ce_offset_weights else glt_ce_offset_weights
+user_config["glt_enable_geom_losses"] = glt_config.enable_geom_losses if glt_config else glt_enable_geom_losses
 user_config["glt_global_num_spans"] = glt_config.global_num_spans if glt_config else glt_global_num_spans
 user_config["glt_global_span_len"] = glt_config.global_span_len if glt_config else glt_global_span_len
 user_config["viz_enabled"] = viz_enabled
@@ -206,6 +220,9 @@ if not use_dummy_wandb:
             "glt_lambda_global",
             "glt_lambda_angle",
             "glt_lambda_bi",
+            "glt_ce_offsets",
+            "glt_ce_offset_weights",
+            "glt_enable_geom_losses",
             "glt_global_num_spans",
             "glt_global_span_len",
             "viz_enabled",

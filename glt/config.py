@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 
 @dataclass
@@ -17,6 +17,10 @@ class GLTConfig:
     lambda_global: float = 0.05
     lambda_angle: float = 0.1
     lambda_bi: float = 0.1
+
+    ce_offsets: Tuple[int, ...] = (-1, 0, 1)
+    ce_offset_weights: Optional[Tuple[float, ...]] = None
+    enable_geom_losses: bool = True
 
     global_num_spans: int = 1
     global_span_len: int = 256

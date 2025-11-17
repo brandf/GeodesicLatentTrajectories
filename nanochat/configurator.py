@@ -47,8 +47,12 @@ for arg in sys.argv[1:]:
             # ensure the types match ok
             if globals()[key] is not None:
                 attempt_type = type(attempt)
-                default_type = type(globals()[key])
-                assert attempt_type == default_type, f"Type mismatch: {attempt_type} != {default_type}"
+                default_value = globals()[key]
+                default_type = type(default_value)
+                if default_type is bool and attempt_type in (int, bool):
+                    attempt = bool(attempt)
+                else:
+                    assert attempt_type == default_type, f"Type mismatch: {attempt_type} != {default_type}"
             # cross fingers
             print0(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt

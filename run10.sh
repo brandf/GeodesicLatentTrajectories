@@ -20,6 +20,9 @@ EOF
 GPU_CHOICE="5090"
 BASE_TRAIN_OVERRIDES=()
 ENABLE_GLT=0
+GLT_OFFSETS="[-1,0,1]"
+GLT_OFFSET_WEIGHTS=""
+GLT_ENABLE_GEOM=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +41,34 @@ while [[ $# -gt 0 ]]; do
             ;;
         --glt)
             ENABLE_GLT=1
+            shift
+            ;;
+        --glt_offsets)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --glt_offsets requires an argument (e.g. '[-1,0,1]')" >&2
+                exit 1
+            fi
+            GLT_OFFSETS="$2"
+            shift 2
+            ;;
+        --glt_offsets=*)
+            GLT_OFFSETS="${1#*=}"
+            shift
+            ;;
+        --glt_offset_weights)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --glt_offset_weights requires an argument (e.g. '[1,0.5,0.5]')" >&2
+                exit 1
+            fi
+            GLT_OFFSET_WEIGHTS="$2"
+            shift 2
+            ;;
+        --glt_offset_weights=*)
+            GLT_OFFSET_WEIGHTS="${1#*=}"
+            shift
+            ;;
+        --glt_no_geom)
+            GLT_ENABLE_GEOM=0
             shift
             ;;
         -h|--help)
@@ -139,6 +170,11 @@ BASE_TRAIN_CMD=(
 )
 if (( ENABLE_GLT )); then
     BASE_TRAIN_CMD+=(--enable_glt=True)
+    BASE_TRAIN_CMD+=(--glt_ce_offsets="$GLT_OFFSETS")
+    BASE_TRAIN_CMD+=(--glt_enable_geom_losses="$GLT_ENABLE_GEOM")
+    if [[ -n "$GLT_OFFSET_WEIGHTS" ]]; then
+        BASE_TRAIN_CMD+=(--glt_ce_offset_weights="$GLT_OFFSET_WEIGHTS")
+    fi
 fi
 BASE_TRAIN_CMD+=("${BASE_TRAIN_OVERRIDES[@]}")
 "${BASE_TRAIN_CMD[@]}"
