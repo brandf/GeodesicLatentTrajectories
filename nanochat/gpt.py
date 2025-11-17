@@ -257,6 +257,7 @@ class GPT(nn.Module):
         latents_dtype: torch.dtype,
         targets: torch.Tensor,
         reduction: str,
+        chunk_size: int,
     ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
         offsets = self.glt_config.ce_offsets
         weights = self.glt_config.ce_offset_weights
@@ -267,8 +268,10 @@ class GPT(nn.Module):
         reduction_is_none = reduction == 'none'
         ce_values: Dict[int, torch.Tensor] = {}
         total = None
-        logits_fn = lambda chunk: self._apply_head(chunk)
-        for offset, weight in zip(offsets, weights_list):
+        max_chunk_tokens = max(1, chunk_size)
+        def logits_fn(chunk):
+            return self._apply_head(chunk)
+        for offset_index, (offset, weight) in enumerate(zip(offsets, weights_list)):
             preds = self._predict_offset_latents(normalized, forward_vec, backward_vec, offset, latents_dtype)
             if offset > 0:
                 pred_slice = preds[:, :-offset, :]
@@ -282,17 +285,34 @@ class GPT(nn.Module):
                 target_slice = targets
             if pred_slice.numel() == 0:
                 continue
-            logits = logits_fn(pred_slice)
-            logits = logits.float()
-            ce = F.cross_entropy(logits.view(-1, logits.size(-1)), target_slice.reshape(-1), ignore_index=-1, reduction=reduction)
+            pred_slice = pred_slice.contiguous().view(-1, pred_slice.size(-1))
+            target_slice = target_slice.reshape(-1)
+            if reduction_is_none:
+                logits = logits_fn(pred_slice).float()
+                ce = F.cross_entropy(logits, target_slice, ignore_index=-1, reduction='none')
+            else:
+                ce_sum = torch.zeros(1, device=pred_slice.device, dtype=torch.float32)
+                count_sum = 0
+                for start in range(0, pred_slice.size(0), max_chunk_tokens):
+                    end = min(start + max_chunk_tokens, pred_slice.size(0))
+                    logits_chunk = logits_fn(pred_slice[start:end]).float()
+                    targets_chunk = target_slice[start:end]
+                    ce_chunk = F.cross_entropy(logits_chunk, targets_chunk, ignore_index=-1, reduction='sum')
+                    ce_sum += ce_chunk
+                    count_sum += (end - start)
+                if reduction == 'mean':
+                    ce = ce_sum / max(1, count_sum)
+                else:
+                    ce = ce_sum
             ce_values[offset] = ce.detach()
             if reduction_is_none:
                 total = ce
                 break
             else:
-                total = (0.0 if total is None else total) + weight * ce
+                scaled = weight * ce
+                total = scaled if total is None else total + scaled
         if total is None:
-            total = torch.tensor(0.0, device=targets.device, dtype=targets.dtype)
+            total = torch.tensor(0.0, device=targets.device, dtype=torch.float32)
         return total, ce_values
 
     def _build_valid_mask(self, targets: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -384,6 +404,7 @@ class GPT(nn.Module):
         latents = self._project_latents(x)
 
         ce_offsets = self.glt_config.ce_offsets if self._glt_enabled else (1,)
+        ce_chunk_size = self.glt_config.ce_offset_chunk_size if self._glt_enabled else 1
         latents_dtype = latents.dtype
         normalized = None
         normalized_latents_for_glt = latents
@@ -411,7 +432,7 @@ class GPT(nn.Module):
         logits = logits.float() # use tf32/fp32 for logits
         ce_components: Dict[int, torch.Tensor] = {}
         if self._glt_enabled and loss_reduction != 'none':
-            ce_loss, ce_components = self._compute_multi_ce_loss(normalized, forward_vec, backward_vec, latents_dtype, targets, loss_reduction)
+            ce_loss, ce_components = self._compute_multi_ce_loss(normalized, forward_vec, backward_vec, latents_dtype, targets, loss_reduction, ce_chunk_size)
         else:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             ce_components[self._select_inference_offset(ce_offsets)] = ce_loss.detach()

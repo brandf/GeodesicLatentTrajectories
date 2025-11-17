@@ -20,6 +20,7 @@ class GLTConfig:
 
     ce_offsets: Tuple[int, ...] = (-1, 0, 1)
     ce_offset_weights: Optional[Tuple[float, ...]] = None
+    ce_offset_chunk_size: int = 2048
     enable_geom_losses: bool = True
 
     global_num_spans: int = 1

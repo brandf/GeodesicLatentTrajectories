@@ -28,10 +28,19 @@ This page explains what each logged metric means, why it matters, and what trend
   *Definition:* CE contribution per step.  
   *Goal:* Mirrors `train/loss`.
 
-- **`loss_components/glt/*` (local, global, angle, bi)**  
-  *Definition:* Raw magnitudes of each GLT penalty before scaling.  
-  *Why:* Diagnose which constraint is fighting CE.  
-  *Goal:* Order-one values; if any term sits at >>1e2 we need extra normalization or lower lambdas.
+- **`loss_components/glt/local`**  
+  *Definition:* Midpoint straightness error—distance between yₜ and the SLERP midpoint of (yₜ₋₁, yₜ₊₁).  
+  *Goal:* Trend toward zero as local curvature flattens.
+- **`loss_components/glt/global`**  
+  *Definition:* Span-level straightness (great-circle deviation over long spans).  
+  *Goal:* Decrease steadily; high plateaus mean long-range wiggles remain.
+- **`loss_components/glt/angle`**  
+  *Definition:* Variance of angular step sizes between successive latents.  
+  *Goal:* Shrink toward zero—constant step sizes make extrapolation reliable.
+- **`loss_components/glt/bi`**  
+  *Definition:* Bidirectional midpoint loss; same as `local` but reversed (predict yₜ from the SLERP between yₜ₊₁ and yₜ₋₁) to check symmetry.  
+  *Goal:* Track `glt/local`; divergence means the trajectory behaves differently forward vs. backward.
+  *Why:* Use these to diagnose which constraint dominates CE; keep them roughly O(1) unless you intentionally crank the lambdas.
 
 ## GLT Scalar Diagnostics
 - **`glt/curvature_mean` & `glt/curvature_std`**  

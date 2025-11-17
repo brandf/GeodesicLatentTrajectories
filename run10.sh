@@ -23,6 +23,7 @@ ENABLE_GLT=0
 GLT_OFFSETS="[-1,0,1]"
 GLT_OFFSET_WEIGHTS=""
 GLT_ENABLE_GEOM=1
+GLT_CE_CHUNK=2048
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -69,6 +70,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --glt_no_geom)
             GLT_ENABLE_GEOM=0
+            shift
+            ;;
+        --glt_ce_chunk)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --glt_ce_chunk requires an argument" >&2
+                exit 1
+            fi
+            GLT_CE_CHUNK="$2"
+            shift 2
+            ;;
+        --glt_ce_chunk=*)
+            GLT_CE_CHUNK="${1#*=}"
             shift
             ;;
         -h|--help)
@@ -175,6 +188,7 @@ if (( ENABLE_GLT )); then
     if [[ -n "$GLT_OFFSET_WEIGHTS" ]]; then
         BASE_TRAIN_CMD+=(--glt_ce_offset_weights="$GLT_OFFSET_WEIGHTS")
     fi
+    BASE_TRAIN_CMD+=(--glt_ce_chunk_size="$GLT_CE_CHUNK")
 fi
 BASE_TRAIN_CMD+=("${BASE_TRAIN_OVERRIDES[@]}")
 "${BASE_TRAIN_CMD[@]}"

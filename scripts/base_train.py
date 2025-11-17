@@ -80,6 +80,7 @@ glt_lambda_scale = 0.3 # downscale GLT penalties for small-budget runs
 glt_ce_offsets = [-1, 0, 1]
 glt_ce_offset_weights = None
 glt_enable_geom_losses = True
+glt_ce_chunk_size = 2048
 glt_global_num_spans = 1
 glt_global_span_len = 256
 # Visualization
@@ -167,6 +168,7 @@ if enable_glt:
         lambda_bi=scaled_lambda_bi,
         ce_offsets=ce_offsets_tuple,
         ce_offset_weights=ce_offset_weights_tuple,
+        ce_offset_chunk_size=int(glt_ce_chunk_size),
         enable_geom_losses=glt_enable_geom_losses,
         global_num_spans=glt_global_num_spans,
         global_span_len=glt_global_span_len,
@@ -201,6 +203,7 @@ user_config["glt_lambda_bi"] = glt_config.lambda_bi if glt_config else glt_lambd
 user_config["glt_lambda_scale"] = glt_lambda_scale
 user_config["glt_ce_offsets"] = list(glt_config.ce_offsets) if glt_config else glt_ce_offsets
 user_config["glt_ce_offset_weights"] = list(glt_config.ce_offset_weights) if glt_config and glt_config.ce_offset_weights else glt_ce_offset_weights
+user_config["glt_ce_chunk_size"] = glt_config.ce_offset_chunk_size if glt_config else glt_ce_chunk_size
 user_config["glt_enable_geom_losses"] = glt_config.enable_geom_losses if glt_config else glt_enable_geom_losses
 user_config["glt_global_num_spans"] = glt_config.global_num_spans if glt_config else glt_global_num_spans
 user_config["glt_global_span_len"] = glt_config.global_span_len if glt_config else glt_global_span_len
@@ -222,6 +225,7 @@ if not use_dummy_wandb:
             "glt_lambda_bi",
             "glt_ce_offsets",
             "glt_ce_offset_weights",
+            "glt_ce_chunk_size",
             "glt_enable_geom_losses",
             "glt_global_num_spans",
             "glt_global_span_len",
