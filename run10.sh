@@ -23,7 +23,7 @@ ENABLE_GLT=0
 GLT_OFFSETS="[-1,0,1]"
 GLT_OFFSET_WEIGHTS=""
 GLT_ENABLE_GEOM=1
-GLT_CE_CHUNK=2048
+GLT_CE_CHUNK=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

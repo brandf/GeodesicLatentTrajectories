@@ -80,7 +80,7 @@ glt_lambda_scale = 0.3 # downscale GLT penalties for small-budget runs
 glt_ce_offsets = [-1, 0, 1]
 glt_ce_offset_weights = None
 glt_enable_geom_losses = True
-glt_ce_chunk_size = 2048
+glt_ce_chunk_size = 1
 glt_global_num_spans = 1
 glt_global_span_len = 256
 # Visualization

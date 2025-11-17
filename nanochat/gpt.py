@@ -12,6 +12,7 @@ Notable features:
 """
 
 import math
+import os
 from functools import partial
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
@@ -268,7 +269,8 @@ class GPT(nn.Module):
         reduction_is_none = reduction == 'none'
         ce_values: Dict[int, torch.Tensor] = {}
         total = None
-        max_chunk_tokens = max(1, chunk_size)
+        chunk_count = max(1, chunk_size)
+        mem_debug = bool(int(os.environ.get("GLT_MEM_DEBUG", "0"))) and torch.cuda.is_available()
         def logits_fn(chunk):
             return self._apply_head(chunk)
         for offset_index, (offset, weight) in enumerate(zip(offsets, weights_list)):
@@ -291,19 +293,24 @@ class GPT(nn.Module):
                 logits = logits_fn(pred_slice).float()
                 ce = F.cross_entropy(logits, target_slice, ignore_index=-1, reduction='none')
             else:
-                ce_sum = torch.zeros(1, device=pred_slice.device, dtype=torch.float32)
-                count_sum = 0
-                for start in range(0, pred_slice.size(0), max_chunk_tokens):
-                    end = min(start + max_chunk_tokens, pred_slice.size(0))
+                total_tokens = pred_slice.size(0)
+                ce_accum = pred_slice.new_zeros(1, dtype=torch.float32)
+                count_accum = 0
+                chunk_len = max(1, (total_tokens + chunk_count - 1) // chunk_count)
+                for start in range(0, total_tokens, chunk_len):
+                    end = min(start + chunk_len, total_tokens)
                     logits_chunk = logits_fn(pred_slice[start:end]).float()
+                    if mem_debug:
+                        torch.cuda.synchronize()
+                        print(f"[GLT CE] offset={offset:+d} chunk={start}:{end} mem={torch.cuda.max_memory_allocated()/1e9:.2f}GB")
                     targets_chunk = target_slice[start:end]
                     ce_chunk = F.cross_entropy(logits_chunk, targets_chunk, ignore_index=-1, reduction='sum')
-                    ce_sum += ce_chunk
-                    count_sum += (end - start)
+                    ce_accum += ce_chunk
+                    count_accum += (end - start)
                 if reduction == 'mean':
-                    ce = ce_sum / max(1, count_sum)
+                    ce = ce_accum / max(1, count_accum)
                 else:
-                    ce = ce_sum
+                    ce = ce_accum
             ce_values[offset] = ce.detach()
             if reduction_is_none:
                 total = ce
