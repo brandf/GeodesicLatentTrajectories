@@ -24,6 +24,10 @@ GLT_OFFSETS="[-1,0,1]"
 GLT_OFFSET_WEIGHTS=""
 GLT_ENABLE_GEOM=1
 GLT_CE_CHUNK=1
+GLT_CHECKPOINT_AUX=1
+GLT_NORMALIZE_LATENTS=1
+GLT_LINEAR_EXTRAP=0
+GLT_RANDOM_OFFSET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -82,6 +86,38 @@ while [[ $# -gt 0 ]]; do
             ;;
         --glt_ce_chunk=*)
             GLT_CE_CHUNK="${1#*=}"
+            shift
+            ;;
+        --glt_checkpoint_aux)
+            GLT_CHECKPOINT_AUX=1
+            shift
+            ;;
+        --glt_no_checkpoint_aux)
+            GLT_CHECKPOINT_AUX=0
+            shift
+            ;;
+        --glt_normalize_latents)
+            GLT_NORMALIZE_LATENTS=1
+            shift
+            ;;
+        --glt_no_normalize_latents)
+            GLT_NORMALIZE_LATENTS=0
+            shift
+            ;;
+        --glt_linear_extrap)
+            GLT_LINEAR_EXTRAP=1
+            shift
+            ;;
+        --glt_no_linear_extrap)
+            GLT_LINEAR_EXTRAP=0
+            shift
+            ;;
+        --glt_random_offset)
+            GLT_RANDOM_OFFSET=1
+            shift
+            ;;
+        --glt_no_random_offset)
+            GLT_RANDOM_OFFSET=0
             shift
             ;;
         -h|--help)
@@ -189,6 +225,10 @@ if (( ENABLE_GLT )); then
         BASE_TRAIN_CMD+=(--glt_ce_offset_weights="$GLT_OFFSET_WEIGHTS")
     fi
     BASE_TRAIN_CMD+=(--glt_ce_chunk_size="$GLT_CE_CHUNK")
+    BASE_TRAIN_CMD+=(--glt_checkpoint_aux_offsets="$GLT_CHECKPOINT_AUX")
+    BASE_TRAIN_CMD+=(--glt_normalize_latents="$GLT_NORMALIZE_LATENTS")
+    BASE_TRAIN_CMD+=(--glt_linear_extrapolation="$GLT_LINEAR_EXTRAP")
+    BASE_TRAIN_CMD+=(--glt_random_ce_offset="$GLT_RANDOM_OFFSET")
 fi
 BASE_TRAIN_CMD+=("${BASE_TRAIN_OVERRIDES[@]}")
 "${BASE_TRAIN_CMD[@]}"

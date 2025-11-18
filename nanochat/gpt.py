@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+import torch._dynamo as dynamo
 
 from glt.config import GLTConfig
 from glt.geometry import (
@@ -229,13 +230,47 @@ class GPT(nn.Module):
         dtype_out: torch.dtype,
     ) -> torch.Tensor:
         eps = self.glt_config.clamp_eps
+        linear_extrap = self.glt_config.linear_extrapolation
         if offset == 0:
             pred = normalized
         elif offset > 0:
-            pred = glt_exp_map_norm(normalized, forward_vec * float(offset), eps=eps)
+            if linear_extrap:
+                pred = normalized + forward_vec * float(offset)
+            else:
+                pred = glt_exp_map_norm(normalized, forward_vec * float(offset), eps=eps)
         else:
-            pred = glt_exp_map_norm(normalized, backward_vec * float(-offset), eps=eps)
+            if linear_extrap:
+                pred = normalized + backward_vec * float(-offset)
+            else:
+                pred = glt_exp_map_norm(normalized, backward_vec * float(-offset), eps=eps)
         return pred.to(dtype=dtype_out)
+
+    @dynamo.disable
+    @dynamo.disable
+    def _sample_random_offset_tensor(
+        self,
+        offsets: Tuple[int, ...],
+        weights: Optional[Tuple[float, ...]],
+        device: torch.device,
+    ) -> int:
+        if not offsets:
+            return 1
+        offsets_tensor = torch.tensor(offsets, device=device, dtype=torch.float32)
+        if weights is None:
+            probs = torch.ones_like(offsets_tensor)
+        else:
+            weight_tensor = torch.tensor(weights, device=device, dtype=torch.float32)
+            count = min(weight_tensor.numel(), offsets_tensor.numel())
+            probs = torch.zeros_like(offsets_tensor)
+            probs[:count] = weight_tensor[:count]
+            probs[probs < 0] = 0
+        total = probs.sum()
+        if total <= 0:
+            probs = torch.ones_like(offsets_tensor)
+            total = probs.sum()
+        probs = probs / total
+        idx = torch.multinomial(probs, 1)
+        return int(offsets_tensor[idx].item())
 
     @staticmethod
     def _select_inference_offset(offsets: Tuple[int, ...]) -> int:
@@ -253,6 +288,7 @@ class GPT(nn.Module):
 
     def _compute_multi_ce_loss(
         self,
+        offsets: Tuple[int, ...],
         normalized: torch.Tensor,
         forward_vec: torch.Tensor,
         backward_vec: torch.Tensor,
@@ -260,13 +296,19 @@ class GPT(nn.Module):
         targets: torch.Tensor,
         reduction: str,
         chunk_size: int,
+        use_config_weights: bool,
     ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
-        offsets = self.glt_config.ce_offsets
-        weights = self.glt_config.ce_offset_weights
-        if weights is None:
-            weights_list = [1.0 / len(offsets)] * len(offsets)
-        else:
-            weights_list = list(weights)
+        if not offsets:
+            offsets = (1,)
+        weights_list: List[float] = [1.0] * len(offsets)
+        if use_config_weights:
+            cfg_weights = self.glt_config.ce_offset_weights
+            cfg_offsets = self.glt_config.ce_offsets
+            if cfg_weights is not None and cfg_offsets:
+                weight_map = {o: w for o, w in zip(cfg_offsets, cfg_weights)}
+                for i, off in enumerate(offsets):
+                    if off in weight_map:
+                        weights_list[i] = weight_map[off]
         reduction_is_none = reduction == 'none'
         ce_values: Dict[int, torch.Tensor] = {}
         total = None
@@ -275,6 +317,7 @@ class GPT(nn.Module):
         def logits_fn(chunk):
             return self._apply_head(chunk)
         inference_offset = self._select_inference_offset(offsets)
+        checkpoint_aux = self.glt_config.checkpoint_aux_offsets
         for offset_index, (offset, weight) in enumerate(zip(offsets, weights_list)):
             preds = self._predict_offset_latents(normalized, forward_vec, backward_vec, offset, latents_dtype)
             if offset > 0:
@@ -311,7 +354,7 @@ class GPT(nn.Module):
                     end = min(start + chunk_len, total_tokens)
                     pred_chunk = pred_slice[start:end]
                     target_chunk = target_slice[start:end]
-                    use_checkpoint = True
+                    use_checkpoint = checkpoint_aux and offset != inference_offset
                     if use_checkpoint:
                         ce_chunk = checkpoint(lambda pc, tc: compute_ce_slice(pc, tc, start, end), pred_chunk, target_chunk, use_reentrant=False)
                     else:
@@ -421,25 +464,49 @@ class GPT(nn.Module):
         pre_norm = x
         latents = self._project_latents(x)
 
-        ce_offsets = self.glt_config.ce_offsets if self._glt_enabled else (1,)
+        base_ce_offsets = self.glt_config.ce_offsets if self._glt_enabled else (1,)
+        if (
+            self._glt_enabled
+            and self.glt_config.random_ce_offset
+            and len(base_ce_offsets) > 1
+        ):
+            sampled = self._sample_random_offset_tensor(
+                base_ce_offsets,
+                self.glt_config.ce_offset_weights,
+                latents.device,
+            )
+            ce_offsets = (sampled,)
+        else:
+            ce_offsets = base_ce_offsets
         ce_chunk_size = self.glt_config.ce_offset_chunk_size if self._glt_enabled else 1
         latents_dtype = latents.dtype
         normalized = None
         normalized_latents_for_glt = latents
+        normalize_latents = self.glt_config.normalize_latents if self._glt_enabled else False
+        linear_extrap = self.glt_config.linear_extrapolation if self._glt_enabled else False
         forward_vec = None
         backward_vec = None
         if self._glt_enabled:
             work_dtype = torch.float32 if latents_dtype in (torch.float16, torch.bfloat16) else latents_dtype
-            normalized = glt_normalize(latents.to(work_dtype), eps=self.glt_config.norm_eps)
-            normalized_latents_for_glt = normalized
+            if normalize_latents:
+                normalized = glt_normalize(latents.to(work_dtype), eps=self.glt_config.norm_eps)
+                normalized_latents_for_glt = normalized
+            else:
+                normalized = latents.to(work_dtype)
+                normalized_latents_for_glt = latents.to(work_dtype)
             forward_vec = torch.zeros_like(normalized)
             backward_vec = torch.zeros_like(normalized)
             curr = normalized[:, :-1, :]
             next_lat = normalized[:, 1:, :]
-            forward_vec[:, :-1, :] = glt_log_map_norm(curr, next_lat, eps=self.glt_config.clamp_eps)
-            prev_lat = normalized[:, :-1, :]
-            backward_curr = normalized[:, 1:, :]
-            backward_vec[:, 1:, :] = glt_log_map_norm(backward_curr, prev_lat, eps=self.glt_config.clamp_eps)
+            if linear_extrap:
+                # forward vector uses previous slope: y_t - y_{t-1}
+                forward_vec[:, 1:, :] = normalized[:, 1:, :] - normalized[:, :-1, :]
+                backward_vec[:, :-1, :] = normalized[:, :-1, :] - normalized[:, 1:, :]
+            else:
+                forward_vec[:, :-1, :] = glt_log_map_norm(curr, next_lat, eps=self.glt_config.clamp_eps)
+                prev_lat = normalized[:, :-1, :]
+                backward_curr = normalized[:, 1:, :]
+                backward_vec[:, 1:, :] = glt_log_map_norm(backward_curr, prev_lat, eps=self.glt_config.clamp_eps)
             inference_offset = self._select_inference_offset(ce_offsets)
             logits_latents = self._predict_offset_latents(normalized, forward_vec, backward_vec, inference_offset, latents_dtype)
         else:
@@ -450,7 +517,18 @@ class GPT(nn.Module):
         logits = logits.float() # use tf32/fp32 for logits
         ce_components: Dict[int, torch.Tensor] = {}
         if self._glt_enabled and loss_reduction != 'none':
-            ce_loss, ce_components = self._compute_multi_ce_loss(normalized, forward_vec, backward_vec, latents_dtype, targets, loss_reduction, ce_chunk_size)
+            apply_weights = not (self.glt_config.random_ce_offset)
+            ce_loss, ce_components = self._compute_multi_ce_loss(
+                ce_offsets,
+                normalized,
+                forward_vec,
+                backward_vec,
+                latents_dtype,
+                targets,
+                loss_reduction,
+                ce_chunk_size,
+                apply_weights,
+            )
         else:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             ce_components[self._select_inference_offset(ce_offsets)] = ce_loss.detach()
