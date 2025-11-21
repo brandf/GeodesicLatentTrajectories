@@ -51,6 +51,8 @@ for arg in sys.argv[1:]:
                 default_type = type(default_value)
                 if default_type is bool and attempt_type in (int, bool):
                     attempt = bool(attempt)
+                elif default_type is float and attempt_type is int:
+                    attempt = float(attempt)
                 else:
                     assert attempt_type == default_type, f"Type mismatch: {attempt_type} != {default_type}"
             # cross fingers

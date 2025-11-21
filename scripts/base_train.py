@@ -14,6 +14,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json
+import ast
 import time
 from contextlib import nullcontext
 
@@ -23,6 +24,7 @@ import torch
 from glt.config import GLTConfig
 from glt.viz_config import VizConfig
 from glt.logging import VizBatch, maybe_log_visualizations
+from seqexrap.config import SequenceExtrapolationConfig
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -87,6 +89,14 @@ glt_linear_extrapolation = False
 glt_random_ce_offset = False
 glt_global_num_spans = 1
 glt_global_span_len = 256
+# Sequence Extrapolation (optional)
+enable_se = False
+se_extrap_len = 8
+se_extrap_layers = 3
+se_predict_horizon = 2
+se_velocity_softcap = 0.0
+se_loss_weight = 1.0
+se_val_compare_horizons = "" # e.g. "[1,2]" to compute extra val bpb per SE horizon
 # Visualization
 viz_enabled = False
 viz_scalar_every = 10
@@ -138,7 +148,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # -----------------------------------------------------------------------------
-# Checkpoint / GLT configuration
+# Checkpoint / GLT/SE configuration
 base_dir = get_base_dir()
 output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
@@ -191,6 +201,36 @@ if glt_config:
     print0(f"[GLT] Enabled with config: {glt_config_kwargs}")
 else:
     print0("[GLT] Disabled")
+se_config_kwargs = None
+if enable_se:
+    se_config_kwargs = SequenceExtrapolationConfig(
+        enabled=True,
+        extrapolation_length=int(se_extrap_len),
+        extrapolation_layers=int(se_extrap_layers),
+        predict_horizon=int(se_predict_horizon),
+        velocity_softcap=float(se_velocity_softcap),
+        loss_weight=float(se_loss_weight),
+    ).to_dict()
+if resuming and meta_data is not None:
+    saved_se = meta_data.get("se_config", None)
+    if saved_se is None and enable_se:
+        print0("[SE] Checkpoint does not contain SE metadata; disabling SE for resume.")
+    se_config_kwargs = saved_se
+se_config = SequenceExtrapolationConfig(**se_config_kwargs) if se_config_kwargs else None
+if se_config:
+    print0(f"[SE] Enabled with config: {se_config_kwargs}")
+else:
+    print0("[SE] Disabled")
+if glt_config and se_config:
+    raise ValueError("GLT and SE cannot be enabled at the same time.")
+se_val_compare_list = []
+if se_val_compare_horizons and se_val_compare_horizons.strip():
+    try:
+        parsed = ast.literal_eval(se_val_compare_horizons)
+        if isinstance(parsed, (list, tuple)):
+            se_val_compare_list = [int(x) for x in parsed if int(x) > 0]
+    except Exception:
+        print0(f"[SE] Warning: could not parse se_val_compare_horizons={se_val_compare_horizons!r}")
 viz_cfg = VizConfig(
     enabled=viz_enabled,
     scalar_every=viz_scalar_every,
@@ -219,6 +259,13 @@ user_config["glt_random_ce_offset"] = glt_config.random_ce_offset if glt_config 
 user_config["glt_enable_geom_losses"] = glt_config.enable_geom_losses if glt_config else glt_enable_geom_losses
 user_config["glt_global_num_spans"] = glt_config.global_num_spans if glt_config else glt_global_num_spans
 user_config["glt_global_span_len"] = glt_config.global_span_len if glt_config else glt_global_span_len
+user_config["enable_se"] = bool(se_config)
+user_config["se_extrap_len"] = se_config.extrapolation_length if se_config else se_extrap_len
+user_config["se_extrap_layers"] = se_config.extrapolation_layers if se_config else se_extrap_layers
+user_config["se_predict_horizon"] = se_config.predict_horizon if se_config else se_predict_horizon
+user_config["se_velocity_softcap"] = se_config.velocity_softcap if se_config else se_velocity_softcap
+user_config["se_loss_weight"] = se_config.loss_weight if se_config else se_loss_weight
+user_config["se_val_compare_horizons"] = se_val_compare_horizons
 user_config["viz_enabled"] = viz_enabled
 user_config["viz_scalar_every"] = viz_scalar_every
 user_config["viz_hist_every"] = viz_hist_every
@@ -241,6 +288,13 @@ if not use_dummy_wandb:
             "glt_enable_geom_losses",
             "glt_global_num_spans",
             "glt_global_span_len",
+            "enable_se",
+            "se_extrap_len",
+            "se_extrap_layers",
+            "se_predict_horizon",
+            "se_velocity_softcap",
+            "se_loss_weight",
+            "se_val_compare_horizons",
             "viz_enabled",
             "viz_scalar_every",
             "viz_hist_every",
@@ -257,7 +311,7 @@ if not use_dummy_wandb:
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config, glt_config=glt_config)
+    model = GPT(model_config, glt_config=glt_config, se_config=se_config)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -357,6 +411,7 @@ while True:
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or step % eval_every == 0:
         model.eval()
+        orig_model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
@@ -364,13 +419,27 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        extra_val = {}
+        if se_config and se_val_compare_list:
+            for horizon in se_val_compare_list:
+                prev_h = orig_model.se_config.predict_horizon
+                orig_model.se_config.predict_horizon = horizon
+                with autocast_ctx:
+                    val_extra = evaluate_bpb(orig_model, build_val_loader(), eval_steps, token_bytes)
+                orig_model.se_config.predict_horizon = prev_h
+                key = f"val/bpb_se_h{horizon}"
+                extra_val[key] = val_extra
+                print0(f"Step {step:05d} | Validation bpb (SE horizon {horizon}): {val_extra:.4f}")
+        log_payload = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        }, step=step)
+        }
+        log_payload.update(extra_val)
+        wandb_run.log(log_payload, step=step)
         model.train()
+        orig_model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -421,6 +490,7 @@ while True:
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
                 "glt_config": glt_config_kwargs,
+                "se_config": se_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": device_batch_size,
                 "max_seq_len": max_seq_len,
@@ -444,13 +514,14 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    loss_breakdown_acc = {} if glt_config else None
+    want_breakdown = glt_config is not None or se_config is not None
+    loss_breakdown_acc = {} if want_breakdown else None
     need_viz_data = viz_cfg.needs_batch_data(step)
     viz_batch_data = None
     last_ce_loss = None
     for micro_step in range(grad_accum_steps):
         model_kwargs = {}
-        if glt_config:
+        if want_breakdown:
             model_kwargs["return_loss_breakdown"] = True
         request_visuals = need_viz_data and viz_batch_data is None
         if request_visuals:
@@ -469,7 +540,11 @@ while True:
         if breakdown is not None:
             if loss_breakdown_acc is not None:
                 for k, v in breakdown.items():
-                    loss_breakdown_acc[k] = loss_breakdown_acc.get(k, 0.0) + float(v.detach().cpu())
+                    if hasattr(v, "detach"):
+                        v_val = float(v.detach().cpu())
+                    else:
+                        v_val = float(v)
+                    loss_breakdown_acc[k] = loss_breakdown_acc.get(k, 0.0) + v_val
             ce_component = breakdown.get("ce")
             if ce_component is not None:
                 last_ce_loss = ce_component.detach()
@@ -522,18 +597,27 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    glt_print = ""
+    extra_prints = []
     if glt_config and loss_breakdown_avg:
         glt_parts = ", ".join(
             f"{k}={v:.4f}" for k, v in loss_breakdown_avg.items() if k.startswith("glt/")
         )
         if glt_parts:
-            glt_print = f" | glt[{glt_parts}]"
+            extra_prints.append(f"glt[{glt_parts}]")
+    if se_config and loss_breakdown_avg:
+        se_parts = ", ".join(
+            f"{k}={v:.4f}" for k, v in loss_breakdown_avg.items() if k.startswith("se/")
+        )
+        if se_parts:
+            extra_prints.append(f"se[{se_parts}]")
+    extra_text = ""
+    if extra_prints:
+        extra_text = " | " + " ".join(extra_prints)
     if glt_config:
         loss_text = f"loss_ce: {debiased_ce_loss:.6f} | loss_total: {debiased_total_loss:.6f}"
     else:
         loss_text = f"loss: {debiased_total_loss:.6f}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | {loss_text} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m{glt_print}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | {loss_text} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m{extra_text}")
     if log_every > 0 and step % log_every == 0:
         log_data = {
             "step": step,
@@ -547,6 +631,8 @@ while True:
         }
         if glt_config:
             log_data["glt/loss"] = debiased_total_loss
+        if se_config:
+            log_data["se/loss"] = debiased_total_loss
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
         if loss_breakdown_avg:
@@ -569,6 +655,7 @@ from nanochat.report import get_report
 get_report().log(section="Base model training", data=[
     user_config, # CLI args
     {"GLT config": glt_config_kwargs or "disabled"},
+    {"SE config": se_config_kwargs or "disabled"},
     { # stats about the training setup
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",

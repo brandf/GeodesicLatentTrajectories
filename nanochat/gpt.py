@@ -35,6 +35,8 @@ from glt.losses import (
     global_straightness_loss,
     local_midpoint_loss,
 )
+from seqexrap.config import SequenceExtrapolationConfig
+from seqexrap.extrapolator import SequenceExtrapolator
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
@@ -79,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, attn_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -101,7 +103,9 @@ class CausalSelfAttention(nn.Module):
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
+        if attn_mask is not None and kv_cache is None:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+        elif kv_cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
@@ -145,23 +149,42 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin, kv_cache, attn_mask=None):
+        x = x + self.attn(norm(x), cos_sin, kv_cache, attn_mask=attn_mask)
         x = x + self.mlp(norm(x))
         return x
 
 
 class GPT(nn.Module):
-    def __init__(self, config, glt_config: Optional[GLTConfig] = None):
+    def __init__(
+        self,
+        config,
+        glt_config: Optional[GLTConfig] = None,
+        se_config: Optional[SequenceExtrapolationConfig] = None,
+    ):
         super().__init__()
         self.config = config
         self.glt_config = glt_config if glt_config and glt_config.enabled else None
         self._glt_enabled = self.glt_config is not None
+        self.se_config = se_config if se_config and se_config.enabled else None
+        self._se_enabled = self.se_config is not None
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.se_extrapolator = None
+        if self._se_enabled:
+            def build_extrap_block(idx: int) -> Block:
+                return Block(config, layer_idx=config.n_layer + idx)
+            self.se_extrapolator = SequenceExtrapolator(
+                block_builder=build_extrap_block,
+                num_layers=self.se_config.extrapolation_layers,
+                window=self.se_config.extrapolation_length,
+                model_dim=config.n_embd,
+                velocity_softcap=self.se_config.velocity_softcap,
+                norm_fn=norm,
+            )
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -180,6 +203,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+        if self.se_extrapolator is not None:
+            for block in self.se_extrapolator.blocks:
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.zeros_(self.se_extrapolator.delta.weight)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -402,6 +430,69 @@ class GPT(nn.Module):
         }
         return losses
 
+    def _run_sequence_extrapolation(
+        self,
+        latents: torch.Tensor,
+        targets: Optional[torch.Tensor],
+        cos_sin,
+        loss_reduction: str,
+        return_loss_breakdown: bool,
+    ):
+        assert self._se_enabled and self.se_extrapolator is not None
+        ce_losses: List[torch.Tensor] = []
+        ce_components: Dict[str, torch.Tensor] = {}
+        velocity_norms: List[torch.Tensor] = []
+        logits_for_inference: Optional[torch.Tensor] = None
+        total_valid_tokens = 0
+        current = latents
+        horizon = max(1, int(self.se_config.predict_horizon))
+        for step in range(1, horizon + 1):
+            velocity = self.se_extrapolator(current, cos_sin)
+            velocity_norms.append(velocity.norm(p=2, dim=-1).detach())
+            current = current + velocity
+            if logits_for_inference is None:
+                logits_for_inference = self._apply_head(current)
+            if targets is None:
+                continue
+            target_slice = targets[:, step - 1 :]
+            if target_slice.numel() == 0:
+                continue
+            pred_slice = current[:, :target_slice.size(1), :]
+            logits = self._apply_head(pred_slice)
+            ce_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                target_slice.reshape(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
+            ce_losses.append(ce_loss)
+            ce_components[f"se/ce@+{step}"] = ce_loss.detach()
+            total_valid_tokens += target_slice.numel()
+        if targets is None:
+            return None, {}, logits_for_inference
+        if not ce_losses:
+            total_loss = torch.tensor(0.0, device=latents.device, dtype=torch.float32)
+        elif loss_reduction == 'none':
+            total_loss = ce_losses[0]
+        elif loss_reduction == 'sum':
+            total_loss = torch.stack(ce_losses).sum()
+        else:
+            total_loss = torch.stack(ce_losses).mean()
+        total_loss = total_loss * float(self.se_config.loss_weight)
+        breakdown = None
+        if return_loss_breakdown:
+            breakdown = {"ce": total_loss.detach()}
+            breakdown.update(ce_components)
+            if velocity_norms:
+                first_norm = velocity_norms[0]
+                breakdown["se/velocity_norm_mean"] = first_norm.mean().detach()
+                breakdown["se/velocity_norm_max"] = first_norm.max().detach()
+            breakdown["se/valid_tokens"] = float(total_valid_tokens)
+        extras = {}
+        if breakdown is not None:
+            extras["loss_breakdown"] = breakdown
+        return total_loss, extras, logits_for_inference
+
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -418,9 +509,12 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
+        if self.se_extrapolator is not None:
+            matrix_params += list(self.se_extrapolator.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        tracked_params = list(matrix_params) + list(embedding_params) + list(lm_head_params)
+        assert len(list(self.parameters())) == len(tracked_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -459,10 +553,32 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            x = block(x, cos_sin, kv_cache, attn_mask=None)
         x = norm(x)
         pre_norm = x
         latents = self._project_latents(x)
+
+        if self._se_enabled:
+            se_loss, se_extras, se_logits = self._run_sequence_extrapolation(
+                latents,
+                targets,
+                cos_sin,
+                loss_reduction,
+                return_loss_breakdown,
+            )
+            if targets is None:
+                return se_logits
+            extras = se_extras or {}
+            if return_visuals:
+                mask = self._build_valid_mask(targets)
+                extras["visuals"] = {
+                    "latents": latents.detach().to(device="cpu", dtype=torch.float32),
+                    "pre_norm": pre_norm.detach().to(device="cpu", dtype=torch.float32),
+                    "mask": None if mask is None else mask.detach().to("cpu"),
+                }
+            if extras:
+                return se_loss, extras
+            return se_loss
 
         base_ce_offsets = self.glt_config.ce_offsets if self._glt_enabled else (1,)
         if (

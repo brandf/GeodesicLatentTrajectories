@@ -13,13 +13,14 @@ Usage: bash run10.sh [--gpu 5090|h100] [base_train_overrides...]
 
 The optional base_train_overrides are forwarded verbatim to
 `python -m scripts.base_train` after the default $10 profile flags.
-Pass --glt to enable Geodesic Latent Trajectories losses during training.
+Pass --se to enable Sequence Extrapolation or --glt to enable Geodesic Latent Trajectories losses during training.
 EOF
 }
 
 GPU_CHOICE="5090"
 BASE_TRAIN_OVERRIDES=()
 ENABLE_GLT=0
+ENABLE_SE=0
 GLT_OFFSETS="[-1,0,1]"
 GLT_OFFSET_WEIGHTS=""
 GLT_ENABLE_GEOM=1
@@ -28,6 +29,11 @@ GLT_CHECKPOINT_AUX=1
 GLT_NORMALIZE_LATENTS=1
 GLT_LINEAR_EXTRAP=0
 GLT_RANDOM_OFFSET=0
+SE_EXTRAP_LEN=8
+SE_EXTRAP_LAYERS=3
+SE_PREDICT_HORIZON=2
+SE_VELOCITY_SOFTCAP=0
+SE_LOSS_WEIGHT=1.0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +52,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --glt)
             ENABLE_GLT=1
+            shift
+            ;;
+        --se)
+            ENABLE_SE=1
             shift
             ;;
         --glt_offsets)
@@ -120,6 +130,66 @@ while [[ $# -gt 0 ]]; do
             GLT_RANDOM_OFFSET=0
             shift
             ;;
+        --se_extrap_len)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --se_extrap_len requires an argument" >&2
+                exit 1
+            fi
+            SE_EXTRAP_LEN="$2"
+            shift 2
+            ;;
+        --se_extrap_len=*)
+            SE_EXTRAP_LEN="${1#*=}"
+            shift
+            ;;
+        --se_extrap_layers)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --se_extrap_layers requires an argument" >&2
+                exit 1
+            fi
+            SE_EXTRAP_LAYERS="$2"
+            shift 2
+            ;;
+        --se_extrap_layers=*)
+            SE_EXTRAP_LAYERS="${1#*=}"
+            shift
+            ;;
+        --se_predict_horizon)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --se_predict_horizon requires an argument" >&2
+                exit 1
+            fi
+            SE_PREDICT_HORIZON="$2"
+            shift 2
+            ;;
+        --se_predict_horizon=*)
+            SE_PREDICT_HORIZON="${1#*=}"
+            shift
+            ;;
+        --se_velocity_softcap)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --se_velocity_softcap requires an argument" >&2
+                exit 1
+            fi
+            SE_VELOCITY_SOFTCAP="$2"
+            shift 2
+            ;;
+        --se_velocity_softcap=*)
+            SE_VELOCITY_SOFTCAP="${1#*=}"
+            shift
+            ;;
+        --se_loss_weight)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --se_loss_weight requires an argument" >&2
+                exit 1
+            fi
+            SE_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --se_loss_weight=*)
+            SE_LOSS_WEIGHT="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -130,6 +200,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if (( ENABLE_GLT && ENABLE_SE )); then
+    echo "error: --glt and --se cannot be used together; prefer --se for Sequence Extrapolation." >&2
+    exit 1
+fi
 
 case "$GPU_CHOICE" in
     5090)
@@ -169,6 +244,9 @@ if (( EFFECTIVE_TOTAL_BATCH != TARGET_TOTAL_BATCH )); then
 fi
 if (( ENABLE_GLT )); then
     echo "[run10] GLT enabled (will pass --enable_glt=True to base_train)"
+fi
+if (( ENABLE_SE )); then
+    echo "[run10] SE enabled (will pass --enable_se=True to base_train)"
 fi
 
 export OMP_NUM_THREADS=1
@@ -229,6 +307,14 @@ if (( ENABLE_GLT )); then
     BASE_TRAIN_CMD+=(--glt_normalize_latents="$GLT_NORMALIZE_LATENTS")
     BASE_TRAIN_CMD+=(--glt_linear_extrapolation="$GLT_LINEAR_EXTRAP")
     BASE_TRAIN_CMD+=(--glt_random_ce_offset="$GLT_RANDOM_OFFSET")
+fi
+if (( ENABLE_SE )); then
+    BASE_TRAIN_CMD+=(--enable_se=True)
+    BASE_TRAIN_CMD+=(--se_extrap_len="$SE_EXTRAP_LEN")
+    BASE_TRAIN_CMD+=(--se_extrap_layers="$SE_EXTRAP_LAYERS")
+    BASE_TRAIN_CMD+=(--se_predict_horizon="$SE_PREDICT_HORIZON")
+    BASE_TRAIN_CMD+=(--se_velocity_softcap="$SE_VELOCITY_SOFTCAP")
+    BASE_TRAIN_CMD+=(--se_loss_weight="$SE_LOSS_WEIGHT")
 fi
 BASE_TRAIN_CMD+=("${BASE_TRAIN_OVERRIDES[@]}")
 "${BASE_TRAIN_CMD[@]}"
