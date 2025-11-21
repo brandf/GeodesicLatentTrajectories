@@ -53,6 +53,9 @@ for arg in sys.argv[1:]:
                     attempt = bool(attempt)
                 elif default_type is float and attempt_type is int:
                     attempt = float(attempt)
+                elif default_type is str and attempt_type in (list, tuple):
+                    # allow list/tuple overrides for string defaults (e.g., JSON-like args)
+                    attempt = attempt
                 else:
                     assert attempt_type == default_type, f"Type mismatch: {attempt_type} != {default_type}"
             # cross fingers

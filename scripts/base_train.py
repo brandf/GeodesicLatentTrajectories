@@ -15,6 +15,9 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json
 import math
+import ast
+import random
+from collections import defaultdict
 import time
 from contextlib import nullcontext
 
@@ -98,6 +101,9 @@ se_predict_horizon = 2
 se_velocity_softcap = 0.0
 se_loss_weight = 1.0
 se_val_max_horizon = 0 # optional: evaluate all horizons 1..N during val; 0 disables
+se_loss_last_only = False
+se_train_sample_horizon = False
+se_horizon_probs = "" # optional list of probabilities per horizon (e.g., "[0.8,0.2]")
 # Visualization
 viz_enabled = False
 viz_scalar_every = 10
@@ -204,6 +210,18 @@ else:
     print0("[GLT] Disabled")
 se_config_kwargs = None
 if enable_se:
+    horizon_probs_tuple = None
+    if se_horizon_probs:
+        try:
+            parsed_probs = ast.literal_eval(se_horizon_probs)
+            if isinstance(parsed_probs, (list, tuple)):
+                probs = [float(p) for p in parsed_probs if float(p) >= 0]
+                total_p = sum(probs)
+                if total_p > 0:
+                    probs = [p / total_p for p in probs]
+                    horizon_probs_tuple = tuple(probs)
+        except Exception:
+            print0(f"[SE] Warning: could not parse se_horizon_probs={se_horizon_probs!r}")
     se_config_kwargs = SequenceExtrapolationConfig(
         enabled=True,
         extrapolation_length=int(se_extrap_len),
@@ -211,6 +229,9 @@ if enable_se:
         predict_horizon=int(se_predict_horizon),
         velocity_softcap=float(se_velocity_softcap),
         loss_weight=float(se_loss_weight),
+        loss_last_only=bool(se_loss_last_only),
+        train_sample_horizon=bool(se_train_sample_horizon),
+        horizon_probs=horizon_probs_tuple,
     ).to_dict()
 if resuming and meta_data is not None:
     saved_se = meta_data.get("se_config", None)
@@ -260,6 +281,9 @@ user_config["se_predict_horizon"] = se_config.predict_horizon if se_config else 
 user_config["se_velocity_softcap"] = se_config.velocity_softcap if se_config else se_velocity_softcap
 user_config["se_loss_weight"] = se_config.loss_weight if se_config else se_loss_weight
 user_config["se_val_max_horizon"] = se_val_max_horizon
+user_config["se_loss_last_only"] = se_config.loss_last_only if se_config else se_loss_last_only
+user_config["se_train_sample_horizon"] = se_config.train_sample_horizon if se_config else se_train_sample_horizon
+user_config["se_horizon_probs"] = list(se_config.horizon_probs) if se_config and se_config.horizon_probs else se_horizon_probs
 user_config["viz_enabled"] = viz_enabled
 user_config["viz_scalar_every"] = viz_scalar_every
 user_config["viz_hist_every"] = viz_hist_every
@@ -289,6 +313,9 @@ if not use_dummy_wandb:
             "se_velocity_softcap",
             "se_loss_weight",
             "se_val_max_horizon",
+            "se_loss_last_only",
+            "se_train_sample_horizon",
+            "se_horizon_probs",
             "viz_enabled",
             "viz_scalar_every",
             "viz_hist_every",
@@ -360,6 +387,27 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
+
+# Optional: precompile SE horizons to avoid compile jitter during training
+def warm_compile_se():
+    if not se_config or not se_config.train_sample_horizon or se_config.predict_horizon <= 1:
+        return
+    max_h = se_config.predict_horizon
+    try:
+        model.train()
+        for h in range(1, max_h + 1):
+            with autocast_ctx:
+                warm_loss = model(x, y, se_horizon_override=h)
+            if torch.is_tensor(warm_loss):
+                warm_loss = warm_loss.mean()
+            warm_loss.backward()
+            model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize() if device_type == "cuda" else None
+        print0(f"[SE] Warmed compiled graphs for horizons 1..{max_h}")
+    except Exception as e:
+        print0(f"[SE] Warm compile skipped due to: {e}")
+
+warm_compile_se()
 
 # Learning rate scheduler
 def get_lr_multiplier(it):
@@ -437,6 +485,8 @@ if not resuming:
     smooth_total_loss = 0 # EMA of total (optimization) loss
     smooth_ce_loss = 0 # EMA of baseline CE loss
     total_training_time = 0 # total wall-clock time of training
+    dt_accum = 0.0
+    dt_accum_count = 0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -444,6 +494,11 @@ else:
     smooth_total_loss = loop_state.get("smooth_total_loss", loop_state.get("smooth_train_loss", 0))
     smooth_ce_loss = loop_state.get("smooth_ce_loss", smooth_total_loss)
     total_training_time = loop_state["total_training_time"]
+    dt_accum = 0.0
+    dt_accum_count = 0
+se_cached_metrics = {}
+se_h_counts = defaultdict(int)
+se_h_total = 0
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -470,9 +525,9 @@ while True:
             se_config.predict_horizon = prev_h
             if orig_model.se_config is not None:
                 orig_model.se_config.predict_horizon = prev_h
-            val_bpb = val_bpbs.get(prev_h, float('inf'))
+            val_bpb = val_bpbs.get(1, float('inf'))
             for h, bpb_val in val_bpbs.items():
-                key = "val/bpb" if h == prev_h else f"val/bpb_se_h{h}"
+                key = "val/bpb" if h == 1 else f"val/bpb_se_h{h}"
                 extra_val[key] = bpb_val
                 print0(f"Step {step:05d} | Validation bpb (SE horizon {h}): {bpb_val:.4f}")
         else:
@@ -571,10 +626,25 @@ while True:
     need_viz_data = viz_cfg.needs_batch_data(step)
     viz_batch_data = None
     last_ce_loss = None
+    se_sampled_h = None
+    if se_config and se_config.train_sample_horizon and se_config.predict_horizon > 1:
+        choices = list(range(1, se_config.predict_horizon + 1))
+        weights = None
+        if se_config.horizon_probs and len(se_config.horizon_probs) >= len(choices):
+            weights = list(se_config.horizon_probs[: len(choices)])
+        if weights is None:
+            se_sampled_h = random.choice(choices)
+        else:
+            se_sampled_h = random.choices(choices, weights=weights, k=1)[0]
+    if se_sampled_h is not None:
+        se_h_counts[se_sampled_h] += 1
+        se_h_total += 1
     for micro_step in range(grad_accum_steps):
         model_kwargs = {}
         if want_breakdown:
             model_kwargs["return_loss_breakdown"] = True
+        if se_sampled_h is not None:
+            model_kwargs["se_horizon_override"] = se_sampled_h
         request_visuals = need_viz_data and viz_batch_data is None
         if request_visuals:
             model_kwargs["return_visuals"] = True
@@ -631,6 +701,8 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    dt_accum += dt
+    dt_accum_count += 1
     # -------------------------------------------------------------------------
 
     # logging
@@ -642,8 +714,9 @@ while True:
     debiased_total_loss = smooth_total_loss / (1 - ema_beta**(step + 1))
     debiased_ce_loss = smooth_ce_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    avg_dt = dt_accum / max(1, dt_accum_count)
+    tok_per_sec = int(total_batch_size / avg_dt)
+    flops_per_sec = num_flops_per_token * total_batch_size / avg_dt
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
@@ -677,7 +750,7 @@ while True:
             "total_training_time": total_training_time,
             "train/loss": debiased_ce_loss,
             "train/lrm": lrm,
-            "train/dt": dt,
+            "train/dt": avg_dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
         }
@@ -685,12 +758,37 @@ while True:
             log_data["glt/loss"] = debiased_total_loss
         if se_config:
             log_data["se/loss"] = debiased_total_loss
+            if se_sampled_h is not None:
+                log_data["se/sample_horizon"] = se_sampled_h
+            max_h_for_frac = se_config.predict_horizon
+            denom = se_h_total if se_h_total > 0 else 1
+            for h in range(1, max_h_for_frac + 1):
+                cnt = se_h_counts.get(h, 0)
+                log_data[f"se/horizon_frac/{h}"] = cnt / denom
+                log_data[f"se/horizon_count/{h}"] = cnt
+            log_data["se/horizon_total"] = se_h_total
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
         if loss_breakdown_avg:
             for metric_name, metric_value in loss_breakdown_avg.items():
                 log_data[f"loss_components/{metric_name}"] = metric_value
+                if se_config and metric_name.startswith("se/"):
+                    se_cached_metrics[metric_name] = metric_value
+        # carry forward last seen se metrics so charts stay dense when sampling horizons
+        if se_config and se_cached_metrics:
+            # ensure each horizon logs a value if we've ever seen it
+            if se_config.predict_horizon > 1:
+                for h in range(1, se_config.predict_horizon + 1):
+                    key = f"loss_components/se/ce@+{h}"
+                    if key not in log_data and f"se/ce@+{h}" in se_cached_metrics:
+                        log_data[key] = se_cached_metrics[f"se/ce@+{h}"]
+            for metric_name, metric_value in se_cached_metrics.items():
+                key = f"loss_components/{metric_name}"
+                if key not in log_data:
+                    log_data[key] = metric_value
         wandb_run.log(log_data, step=step)
+        dt_accum = 0.0
+        dt_accum_count = 0
     if viz_cfg.needs_batch_data(step) and viz_batch_data is not None:
         maybe_log_visualizations(step, viz_cfg, viz_batch_data, wandb_run)
 

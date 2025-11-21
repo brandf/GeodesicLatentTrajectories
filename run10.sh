@@ -34,6 +34,9 @@ SE_EXTRAP_LAYERS=3
 SE_PREDICT_HORIZON=2
 SE_VELOCITY_SOFTCAP=0
 SE_LOSS_WEIGHT=1.0
+SE_LOSS_LAST_ONLY=0
+SE_TRAIN_SAMPLE_H=0
+SE_HORIZON_PROBS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -190,6 +193,38 @@ while [[ $# -gt 0 ]]; do
             SE_LOSS_WEIGHT="${1#*=}"
             shift
             ;;
+        --se_loss_last_only)
+            SE_LOSS_LAST_ONLY=1
+            shift
+            ;;
+        --se_no_loss_last_only)
+            SE_LOSS_LAST_ONLY=0
+            shift
+            ;;
+        --se_train_sample_h)
+            if [[ $# < 2 ]]; then
+                echo "error: --se_train_sample_h requires an argument" >&2
+                exit 1
+            fi
+            SE_TRAIN_SAMPLE_H="$2"
+            shift 2
+            ;;
+        --se_train_sample_h=*)
+            SE_TRAIN_SAMPLE_H="${1#*=}"
+            shift
+            ;;
+        --se_horizon_probs)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --se_horizon_probs requires an argument" >&2
+                exit 1
+            fi
+            SE_HORIZON_PROBS="$2"
+            shift 2
+            ;;
+        --se_horizon_probs=*)
+            SE_HORIZON_PROBS="${1#*=}"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -208,7 +243,7 @@ fi
 
 case "$GPU_CHOICE" in
     5090)
-        DEVICE_BATCH_SIZE=18
+        DEVICE_BATCH_SIZE=12
         GPU_LABEL="RTX 5090"
         ;;
     h100)
@@ -315,6 +350,11 @@ if (( ENABLE_SE )); then
     BASE_TRAIN_CMD+=(--se_predict_horizon="$SE_PREDICT_HORIZON")
     BASE_TRAIN_CMD+=(--se_velocity_softcap="$SE_VELOCITY_SOFTCAP")
     BASE_TRAIN_CMD+=(--se_loss_weight="$SE_LOSS_WEIGHT")
+    BASE_TRAIN_CMD+=(--se_loss_last_only="$SE_LOSS_LAST_ONLY")
+    BASE_TRAIN_CMD+=(--se_train_sample_horizon="$SE_TRAIN_SAMPLE_H")
+    if [[ -n "$SE_HORIZON_PROBS" ]]; then
+        BASE_TRAIN_CMD+=(--se_horizon_probs="$SE_HORIZON_PROBS")
+    fi
 fi
 BASE_TRAIN_CMD+=("${BASE_TRAIN_OVERRIDES[@]}")
 "${BASE_TRAIN_CMD[@]}"

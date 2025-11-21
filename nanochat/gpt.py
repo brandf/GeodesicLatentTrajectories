@@ -13,6 +13,7 @@ Notable features:
 
 import math
 import os
+import random
 from functools import partial
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
@@ -437,17 +438,28 @@ class GPT(nn.Module):
         cos_sin,
         loss_reduction: str,
         return_loss_breakdown: bool,
+        horizon_override: Optional[int] = None,
     ):
         assert self._se_enabled and self.se_extrapolator is not None
+        max_horizon = max(1, int(self.se_config.predict_horizon))
+        work_horizon = max(1, int(horizon_override)) if horizon_override and horizon_override > 0 else max_horizon
+        work_horizon = min(work_horizon, max_horizon)
+
         ce_losses: List[torch.Tensor] = []
         ce_components: Dict[str, torch.Tensor] = {}
         velocity_norms: List[torch.Tensor] = []
         logits_for_inference: Optional[torch.Tensor] = None
         total_valid_tokens = 0
         token_losses: Dict[int, torch.Tensor] = {}
+        last_only = bool(self.se_config.loss_last_only) and self.training
         current = latents
-        horizon = max(1, int(self.se_config.predict_horizon))
-        for step in range(1, horizon + 1):
+        loss_accum = None
+        count_accum = None
+        if last_only and loss_reduction != 'none':
+            loss_accum = torch.zeros((), device=latents.device, dtype=torch.float32, requires_grad=True)
+            count_accum = torch.tensor(0.0, device=latents.device, dtype=torch.float32)
+            ce_for_log_sampled = None
+        for step in range(1, work_horizon + 1):
             velocity = self.se_extrapolator(current, cos_sin)
             velocity_norms.append(velocity.norm(p=2, dim=-1).detach())
             current = current + velocity
@@ -466,25 +478,42 @@ class GPT(nn.Module):
                 ignore_index=-1,
                 reduction=loss_reduction,
             )
-            ce_losses.append(ce_loss)
             ce_components[f"se/ce@+{step}"] = ce_loss.detach()
             total_valid_tokens += target_slice.numel()
             if loss_reduction == 'none':
                 token_losses[step] = ce_loss.view_as(target_slice)
+            if last_only and step != work_horizon:
+                continue
+            if loss_accum is not None:
+                loss_accum = loss_accum + ce_loss
+                count_accum = count_accum + 1.0
+                if ce_for_log_sampled is None:
+                    ce_for_log_sampled = ce_loss.detach()
+            else:
+                ce_losses.append(ce_loss)
         if targets is None:
             return None, {}, logits_for_inference
-        if not ce_losses:
-            total_loss = torch.tensor(0.0, device=latents.device, dtype=torch.float32)
-        elif loss_reduction == 'none':
-            total_loss = ce_losses[0]
-        elif loss_reduction == 'sum':
-            total_loss = torch.stack(ce_losses).sum()
+        if last_only and loss_reduction != 'none':
+            total_loss = loss_accum / torch.clamp_min(count_accum, 1.0)
+            ce_for_log = ce_for_log_sampled if 'ce_for_log_sampled' in locals() and ce_for_log_sampled is not None else total_loss.detach()
         else:
-            total_loss = torch.stack(ce_losses).mean()
+            if not ce_losses:
+                total_loss = torch.tensor(0.0, device=latents.device, dtype=torch.float32)
+            elif loss_reduction == 'none':
+                total_loss = ce_losses[0]
+            elif loss_reduction == 'sum':
+                total_loss = torch.stack(ce_losses).sum()
+            else:
+                total_loss = torch.stack(ce_losses).mean()
+            ce_for_log = ce_components.get(f"se/ce@+{work_horizon}")
+            if 'ce_for_log_sampled' in locals() and ce_for_log_sampled is not None:
+                ce_for_log = ce_for_log_sampled
+            if ce_for_log is None and ce_losses:
+                ce_for_log = ce_losses[-1].detach()
         total_loss = total_loss * float(self.se_config.loss_weight)
         breakdown = None
         if return_loss_breakdown:
-            breakdown = {"ce": total_loss.detach()}
+            breakdown = {"ce": ce_for_log if ce_for_log is not None else total_loss.detach()}
             breakdown.update(ce_components)
             if velocity_norms:
                 first_norm = velocity_norms[0]
@@ -551,7 +580,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_loss_breakdown=False, return_visuals=False):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_loss_breakdown=False, return_visuals=False, se_horizon_override: Optional[int] = None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -578,6 +607,7 @@ class GPT(nn.Module):
                 cos_sin,
                 loss_reduction,
                 return_loss_breakdown,
+                horizon_override=se_horizon_override,
             )
             if targets is None:
                 return se_logits

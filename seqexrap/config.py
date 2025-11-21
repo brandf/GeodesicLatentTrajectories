@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 @dataclass
@@ -12,6 +12,9 @@ class SequenceExtrapolationConfig:
     predict_horizon: int = 2
     velocity_softcap: float = 0.0
     loss_weight: float = 1.0
+    loss_last_only: bool = False
+    train_sample_horizon: bool = False
+    horizon_probs: Optional[Tuple[float, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
