@@ -444,6 +444,7 @@ class GPT(nn.Module):
         velocity_norms: List[torch.Tensor] = []
         logits_for_inference: Optional[torch.Tensor] = None
         total_valid_tokens = 0
+        token_losses: Dict[int, torch.Tensor] = {}
         current = latents
         horizon = max(1, int(self.se_config.predict_horizon))
         for step in range(1, horizon + 1):
@@ -468,6 +469,8 @@ class GPT(nn.Module):
             ce_losses.append(ce_loss)
             ce_components[f"se/ce@+{step}"] = ce_loss.detach()
             total_valid_tokens += target_slice.numel()
+            if loss_reduction == 'none':
+                token_losses[step] = ce_loss.view_as(target_slice)
         if targets is None:
             return None, {}, logits_for_inference
         if not ce_losses:
@@ -491,6 +494,8 @@ class GPT(nn.Module):
         extras = {}
         if breakdown is not None:
             extras["loss_breakdown"] = breakdown
+        if token_losses:
+            extras["se/token_losses"] = token_losses
         return total_loss, extras, logits_for_inference
 
     def get_device(self):
@@ -502,6 +507,14 @@ class GPT(nn.Module):
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        if self._se_enabled and self.se_extrapolator is not None:
+            se_l = self.se_config.extrapolation_layers
+            se_t = max(1, int(self.se_config.extrapolation_length))
+            se_horizon = max(1, int(self.se_config.predict_horizon))
+            # reuse trunk block cost shape but with windowed seq len and fewer layers, scaled by horizon rollout
+            se_block_cost = 12 * se_l * h * q * se_t
+            se_param_cost = 6 * sum(p.numel() for p in self.se_extrapolator.parameters())
+            num_flops_per_token += se_horizon * (se_param_cost + se_block_cost)
         return num_flops_per_token
 
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):

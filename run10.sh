@@ -208,7 +208,7 @@ fi
 
 case "$GPU_CHOICE" in
     5090)
-        DEVICE_BATCH_SIZE=20
+        DEVICE_BATCH_SIZE=18
         GPU_LABEL="RTX 5090"
         ;;
     h100)

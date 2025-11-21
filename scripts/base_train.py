@@ -14,12 +14,13 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json
-import ast
+import math
 import time
 from contextlib import nullcontext
 
 import wandb
 import torch
+import torch.distributed as dist
 
 from glt.config import GLTConfig
 from glt.viz_config import VizConfig
@@ -96,7 +97,7 @@ se_extrap_layers = 3
 se_predict_horizon = 2
 se_velocity_softcap = 0.0
 se_loss_weight = 1.0
-se_val_compare_horizons = "" # e.g. "[1,2]" to compute extra val bpb per SE horizon
+se_val_max_horizon = 0 # optional: evaluate all horizons 1..N during val; 0 disables
 # Visualization
 viz_enabled = False
 viz_scalar_every = 10
@@ -223,14 +224,7 @@ else:
     print0("[SE] Disabled")
 if glt_config and se_config:
     raise ValueError("GLT and SE cannot be enabled at the same time.")
-se_val_compare_list = []
-if se_val_compare_horizons and se_val_compare_horizons.strip():
-    try:
-        parsed = ast.literal_eval(se_val_compare_horizons)
-        if isinstance(parsed, (list, tuple)):
-            se_val_compare_list = [int(x) for x in parsed if int(x) > 0]
-    except Exception:
-        print0(f"[SE] Warning: could not parse se_val_compare_horizons={se_val_compare_horizons!r}")
+se_val_max_horizon = max(0, int(se_val_max_horizon))
 viz_cfg = VizConfig(
     enabled=viz_enabled,
     scalar_every=viz_scalar_every,
@@ -265,7 +259,7 @@ user_config["se_extrap_layers"] = se_config.extrapolation_layers if se_config el
 user_config["se_predict_horizon"] = se_config.predict_horizon if se_config else se_predict_horizon
 user_config["se_velocity_softcap"] = se_config.velocity_softcap if se_config else se_velocity_softcap
 user_config["se_loss_weight"] = se_config.loss_weight if se_config else se_loss_weight
-user_config["se_val_compare_horizons"] = se_val_compare_horizons
+user_config["se_val_max_horizon"] = se_val_max_horizon
 user_config["viz_enabled"] = viz_enabled
 user_config["viz_scalar_every"] = viz_scalar_every
 user_config["viz_hist_every"] = viz_hist_every
@@ -294,7 +288,7 @@ if not use_dummy_wandb:
             "se_predict_horizon",
             "se_velocity_softcap",
             "se_loss_weight",
-            "se_val_compare_horizons",
+            "se_val_max_horizon",
             "viz_enabled",
             "viz_scalar_every",
             "viz_hist_every",
@@ -324,7 +318,7 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
-print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+print0(f"Estimated FLOPs per token (incl. SE if enabled): {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
@@ -386,6 +380,55 @@ def get_muon_momentum(it):
     return momentum
 
 # -----------------------------------------------------------------------------
+# Validation utilities
+
+@torch.no_grad()
+def evaluate_bpb_se(model, batches, steps, token_bytes, horizons):
+    """
+    Compute bpb per SE horizon in a single pass using loss_reduction='none'
+    and the token-level losses returned by the SE forward path.
+    """
+    device = model.get_device()
+    total_nats = {h: torch.tensor(0.0, dtype=torch.float32, device=device) for h in horizons}
+    total_bytes = {h: torch.tensor(0, dtype=torch.int64, device=device) for h in horizons}
+    batch_iter = iter(batches)
+    for _ in range(steps):
+        x, y = next(batch_iter)
+        out = model(x, y, loss_reduction='none', return_loss_breakdown=True)
+        if isinstance(out, tuple):
+            loss_none, extras = out
+        else:
+            loss_none, extras = out, {}
+        token_losses = extras.get("se/token_losses", {})
+        for h in horizons:
+            loss2d = token_losses.get(h)
+            if loss2d is None:
+                continue
+            loss_flat = loss2d.view(-1)
+            y_flat = y[:, h - 1 : h - 1 + loss2d.size(1)].reshape(-1)
+            if (y_flat.int() < 0).any():
+                valid = y_flat >= 0
+                y_safe = torch.where(valid, y_flat, torch.zeros_like(y_flat))
+                num_bytes = torch.where(valid, token_bytes[y_safe], torch.zeros_like(y_flat, dtype=token_bytes.dtype))
+                total_nats[h] += (loss_flat * (num_bytes > 0)).sum()
+                total_bytes[h] += num_bytes.sum()
+            else:
+                num_bytes = token_bytes[y_flat]
+                total_nats[h] += (loss_flat * (num_bytes > 0)).sum()
+                total_bytes[h] += num_bytes.sum()
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if world_size > 1:
+        for h in horizons:
+            dist.all_reduce(total_nats[h], op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_bytes[h], op=dist.ReduceOp.SUM)
+    results = {}
+    for h in horizons:
+        nats = total_nats[h].item()
+        bytes_ = total_bytes[h].item()
+        results[h] = float('inf') if bytes_ == 0 else nats / (math.log(2) * bytes_)
+    return results
+
+# -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
 
 if not resuming:
@@ -414,27 +457,36 @@ while True:
         orig_model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
-        with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
         extra_val = {}
-        if se_config and se_val_compare_list:
-            for horizon in se_val_compare_list:
-                prev_h = orig_model.se_config.predict_horizon
-                orig_model.se_config.predict_horizon = horizon
-                with autocast_ctx:
-                    val_extra = evaluate_bpb(orig_model, build_val_loader(), eval_steps, token_bytes)
+        if se_config:
+            max_h = max(se_val_max_horizon, se_config.predict_horizon)
+            horizons = list(range(1, max_h + 1))
+            prev_h = se_config.predict_horizon
+            se_config.predict_horizon = max_h
+            if orig_model.se_config is not None:
+                orig_model.se_config.predict_horizon = max_h
+            with autocast_ctx:
+                val_bpbs = evaluate_bpb_se(model, val_loader, eval_steps, token_bytes, horizons)
+            se_config.predict_horizon = prev_h
+            if orig_model.se_config is not None:
                 orig_model.se_config.predict_horizon = prev_h
-                key = f"val/bpb_se_h{horizon}"
-                extra_val[key] = val_extra
-                print0(f"Step {step:05d} | Validation bpb (SE horizon {horizon}): {val_extra:.4f}")
+            val_bpb = val_bpbs.get(prev_h, float('inf'))
+            for h, bpb_val in val_bpbs.items():
+                key = "val/bpb" if h == prev_h else f"val/bpb_se_h{h}"
+                extra_val[key] = bpb_val
+                print0(f"Step {step:05d} | Validation bpb (SE horizon {h}): {bpb_val:.4f}")
+        else:
+            with autocast_ctx:
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            extra_val["val/bpb"] = val_bpb
+            print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        min_bpb_candidate = val_bpb if not math.isinf(val_bpb) else min_val_bpb
+        if min_bpb_candidate < min_val_bpb:
+            min_val_bpb = min_bpb_candidate
         log_payload = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
         }
         log_payload.update(extra_val)
         wandb_run.log(log_payload, step=step)
