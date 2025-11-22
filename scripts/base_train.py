@@ -23,6 +23,7 @@ from contextlib import nullcontext
 
 import wandb
 import torch
+import torch._dynamo as dynamo
 import torch.distributed as dist
 
 from glt.config import GLTConfig
@@ -115,6 +116,10 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+# Allow sufficient recompiles for per-shape optimizer graphs and horizon variants.
+dynamo.config.recompile_limit = max(1024, int(se_predict_horizon) + 16)
+dynamo.config.error_on_recompile = False
 
 # Compute init
 device_type = autodetect_device_type() if device_type == "" else device_type
@@ -213,7 +218,10 @@ if enable_se:
     horizon_probs_tuple = None
     if se_horizon_probs:
         try:
-            parsed_probs = ast.literal_eval(se_horizon_probs)
+            if isinstance(se_horizon_probs, (list, tuple)):
+                parsed_probs = se_horizon_probs
+            else:
+                parsed_probs = ast.literal_eval(se_horizon_probs)
             if isinstance(parsed_probs, (list, tuple)):
                 probs = [float(p) for p in parsed_probs if float(p) >= 0]
                 total_p = sum(probs)
@@ -341,7 +349,33 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+want_breakdown_train = bool(enable_glt or enable_se)
+
+# Build compiled forward callables per horizon to avoid recompiles during sampling.
+compiled_fwd_se = {}
+compiled_fwd_default = None
+forward_compile_count = 0
+def make_compiled_fwd(h_override=None):
+    global forward_compile_count
+    forward_compile_count += 1
+    def _fn(idx, tgt):
+        return orig_model(
+            idx,
+            tgt,
+            loss_reduction='mean',
+            return_loss_breakdown=want_breakdown_train,
+            return_visuals=False,
+            se_horizon_override=h_override,
+        )
+    return torch.compile(_fn, dynamic=False)
+
+if enable_se:
+    max_h = int(se_predict_horizon)
+    for h in range(1, max_h + 1):
+        compiled_fwd_se[h] = make_compiled_fwd(h_override=h)
+    compiled_fwd_default = compiled_fwd_se[max_h]
+else:
+    compiled_fwd_default = make_compiled_fwd(h_override=None)
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -388,26 +422,11 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
-# Optional: precompile SE horizons to avoid compile jitter during training
-def warm_compile_se():
-    if not se_config or not se_config.train_sample_horizon or se_config.predict_horizon <= 1:
-        return
-    max_h = se_config.predict_horizon
-    try:
-        model.train()
-        for h in range(1, max_h + 1):
-            with autocast_ctx:
-                warm_loss = model(x, y, se_horizon_override=h)
-            if torch.is_tensor(warm_loss):
-                warm_loss = warm_loss.mean()
-            warm_loss.backward()
-            model.zero_grad(set_to_none=True)
-        torch.cuda.synchronize() if device_type == "cuda" else None
-        print0(f"[SE] Warmed compiled graphs for horizons 1..{max_h}")
-    except Exception as e:
-        print0(f"[SE] Warm compile skipped due to: {e}")
+def warm_compile():
+    # No-op: compile lazily on first use to avoid startup stalls
+    print0("[Compile] Warm compile skipped (lazy compile on first use).")
 
-warm_compile_se()
+warm_compile()
 
 # Learning rate scheduler
 def get_lr_multiplier(it):
@@ -431,22 +450,21 @@ def get_muon_momentum(it):
 # Validation utilities
 
 @torch.no_grad()
-def evaluate_bpb_se(model, batches, steps, token_bytes, horizons):
+def evaluate_bpb_se(model, batches, steps, token_bytes, horizons, horizon_override=None):
     """
-    Compute bpb per SE horizon in a single pass using loss_reduction='none'
-    and the token-level losses returned by the SE forward path.
+    Compute bpb per SE horizon using loss_reduction='none'.
+    Uses the (uncompiled) model to get token-level losses.
     """
-    device = model.get_device()
-    total_nats = {h: torch.tensor(0.0, dtype=torch.float32, device=device) for h in horizons}
-    total_bytes = {h: torch.tensor(0, dtype=torch.int64, device=device) for h in horizons}
+    total_nats = {h: torch.tensor(0.0, dtype=torch.float32, device=model.get_device()) for h in horizons}
+    total_bytes = {h: torch.tensor(0, dtype=torch.int64, device=model.get_device()) for h in horizons}
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        out = model(x, y, loss_reduction='none', return_loss_breakdown=True)
+        out = model(x, y, loss_reduction='none', return_loss_breakdown=True, se_horizon_override=horizon_override)
         if isinstance(out, tuple):
-            loss_none, extras = out
+            _, extras = out
         else:
-            loss_none, extras = out, {}
+            extras = {}
         token_losses = extras.get("se/token_losses", {})
         for h in horizons:
             loss2d = token_losses.get(h)
@@ -518,13 +536,8 @@ while True:
             horizons = list(range(1, max_h + 1))
             prev_h = se_config.predict_horizon
             se_config.predict_horizon = max_h
-            if orig_model.se_config is not None:
-                orig_model.se_config.predict_horizon = max_h
             with autocast_ctx:
-                val_bpbs = evaluate_bpb_se(model, val_loader, eval_steps, token_bytes, horizons)
-            se_config.predict_horizon = prev_h
-            if orig_model.se_config is not None:
-                orig_model.se_config.predict_horizon = prev_h
+                val_bpbs = evaluate_bpb_se(orig_model, val_loader, eval_steps, token_bytes, horizons, horizon_override=max_h)
             val_bpb = val_bpbs.get(1, float('inf'))
             for h, bpb_val in val_bpbs.items():
                 key = "val/bpb" if h == 1 else f"val/bpb_se_h{h}"
@@ -643,13 +656,14 @@ while True:
         model_kwargs = {}
         if want_breakdown:
             model_kwargs["return_loss_breakdown"] = True
-        if se_sampled_h is not None:
-            model_kwargs["se_horizon_override"] = se_sampled_h
         request_visuals = need_viz_data and viz_batch_data is None
         if request_visuals:
             model_kwargs["return_visuals"] = True
         with autocast_ctx:
-            out = model(x, y, **model_kwargs)
+            if se_sampled_h is not None and se_sampled_h in compiled_fwd_se:
+                out = compiled_fwd_se[se_sampled_h](x, y)
+            else:
+                out = compiled_fwd_default(x, y)
         if isinstance(out, tuple):
             loss, extras = out
             breakdown = extras.get("loss_breakdown")
@@ -767,6 +781,7 @@ while True:
                 log_data[f"se/horizon_frac/{h}"] = cnt / denom
                 log_data[f"se/horizon_count/{h}"] = cnt
             log_data["se/horizon_total"] = se_h_total
+            log_data["se/compile_count"] = forward_compile_count
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
         if loss_breakdown_avg:

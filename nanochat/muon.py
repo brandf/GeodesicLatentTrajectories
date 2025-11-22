@@ -6,8 +6,9 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 
-@torch.compile
-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+_zeropower_cache = {}
+
+def _zeropower_core(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -34,6 +35,14 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    key = (G.size(-2), G.size(-1), steps, G.device.type, G.dtype)
+    fn = _zeropower_cache.get(key)
+    if fn is None:
+        fn = torch.compile(_zeropower_core, dynamic=False)
+        _zeropower_cache[key] = fn
+    return fn(G, steps)
 
 class Muon(torch.optim.Optimizer):
     """
